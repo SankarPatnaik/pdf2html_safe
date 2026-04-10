@@ -27,9 +27,12 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
-import fitz  # PyMuPDF
+try:
+    import fitz  # PyMuPDF
+except Exception:  # pragma: no cover - allows running heuristic unit tests without PyMuPDF
+    fitz = None  # type: ignore[assignment]
 
 try:  # Optional but helpful for prettier HTML output.
     from bs4 import BeautifulSoup
@@ -88,6 +91,13 @@ class TextLine:
 class ImageBlock:
     top: float
     html_fragment: str
+
+
+@dataclass
+class TableRegion:
+    start_row: int
+    end_row: int
+    column_x: List[float]
 
 
 @dataclass
@@ -221,6 +231,23 @@ def merge_physical_lines_to_logical_rows(lines: List[TextLine]) -> List[TextLine
     return merged_rows
 
 
+def group_physical_lines_by_row(lines: List[TextLine]) -> List[List[TextLine]]:
+    if not lines:
+        return []
+    ordered = sorted(lines, key=lambda item: (round(item.y0, 1), round(item.x0, 1)))
+    rows: List[List[TextLine]] = [[ordered[0]]]
+    for line in ordered[1:]:
+        anchor = rows[-1][0]
+        same_row = abs(line.y0 - anchor.y0) <= 1.5 and abs(line.y1 - anchor.y1) <= 1.5
+        if same_row:
+            rows[-1].append(line)
+        else:
+            rows.append([line])
+    for row in rows:
+        row.sort(key=lambda item: item.x0)
+    return rows
+
+
 def extract_text_lines(page: fitz.Page) -> List[TextLine]:
     page_dict = page.get_text("dict")
     physical_lines: List[TextLine] = []
@@ -255,6 +282,43 @@ def extract_text_lines(page: fitz.Page) -> List[TextLine]:
     logical_rows = merge_physical_lines_to_logical_rows(physical_lines)
     logical_rows.sort(key=lambda item: (round(item.y0, 1), round(item.x0, 1)))
     return logical_rows
+
+
+def extract_text_rows(page: fitz.Page) -> tuple[List[List[TextLine]], List[TextLine]]:
+    page_dict = page.get_text("dict")
+    physical_lines: List[TextLine] = []
+
+    for block in page_dict["blocks"]:
+        if block["type"] != 0:
+            continue
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            if not spans:
+                continue
+            raw_text = "".join(span.get("text", "") for span in spans)
+            text = normalize_text(raw_text)
+            if not text:
+                continue
+            first_span = spans[0]
+            x0, y0, x1, y1 = line["bbox"]
+            physical_lines.append(
+                TextLine(
+                    text=text,
+                    x0=float(x0),
+                    y0=float(y0),
+                    x1=float(x1),
+                    y1=float(y1),
+                    font_name=str(first_span.get("font", "")),
+                    font_size=float(first_span.get("size", 12.0)),
+                    page_width=float(page.rect.width),
+                    page_height=float(page.rect.height),
+                )
+            )
+
+    rows = group_physical_lines_by_row(physical_lines)
+    logical_rows = [merge_row_segments(row) for row in rows]
+    logical_rows.sort(key=lambda item: (round(item.y0, 1), round(item.x0, 1)))
+    return rows, logical_rows
 
 
 def merge_line_text(parts: List[str]) -> str:
@@ -333,6 +397,25 @@ class TextBlock:
         return sum(1 for ch in letters if ch.isupper()) / len(letters)
 
 
+def is_bullet_line(text: str) -> bool:
+    return bool(
+        re.match(
+            r"^(\u2022|\u25aa|\u25cf|[-*•]|[a-zA-Z]\)|\(\d+\)|\d+\)|[ivxlcdmIVXLCDM]+\)|\d+\.)\s+.+$",
+            text,
+        )
+    )
+
+
+def strip_bullet_prefix(text: str) -> tuple[str, str]:
+    match = re.match(
+        r"^(\u2022|\u25aa|\u25cf|[-*•]|[a-zA-Z]\)|\(\d+\)|\d+\)|[ivxlcdmIVXLCDM]+\)|\d+\.)\s+(.+)$",
+        text,
+    )
+    if not match:
+        return "", text
+    return match.group(1), match.group(2).strip()
+
+
 def group_lines_into_blocks(lines: List[TextLine]) -> List[TextBlock]:
     if not lines:
         return []
@@ -349,8 +432,10 @@ def group_lines_into_blocks(lines: List[TextLine]) -> List[TextBlock]:
         prev_is_short_byline = len(prev.text) <= 40 and (prev.text.endswith('J.') or prev.text.endswith(',J.') or prev.text.endswith('J.,'))
         likely_new_block = (
             current_is_numbered
+            or is_bullet_line(line.text)
             or vertical_gap > max(prev.font_size * 1.15, 10.0)
             or font_delta > 1.8
+            or (line.x0 - prev.x0) > max(prev.font_size * 1.35, 14.0)
             or (indent_delta > max(prev.font_size * 6.0, 72.0) and prev_is_numbered)
             or prev.text.endswith(":")
             or prev_is_short_byline
@@ -404,6 +489,123 @@ def block_to_html(block: TextBlock, page_index: int, total_pages: int, base_inde
     if tag == "h2":
         return tag, f'<h2>{html.escape(text)}</h2>', None
     return tag, f'<p>{html.escape(text)}</p>', None
+
+
+def detect_table_regions(rows: List[List[TextLine]]) -> List[TableRegion]:
+    regions: List[TableRegion] = []
+    i = 0
+    while i < len(rows):
+        row = rows[i]
+        if len(row) < 2:
+            i += 1
+            continue
+        if any(is_bullet_line(cell.text) for cell in row):
+            i += 1
+            continue
+
+        run_start = i
+        run_rows = [row]
+        j = i + 1
+        while j < len(rows):
+            nxt = rows[j]
+            if len(nxt) < 2 or any(is_bullet_line(cell.text) for cell in nxt):
+                break
+            gap = nxt[0].y0 - rows[j - 1][0].y1
+            if gap > max(rows[j - 1][0].font_size * 1.8, 14.0):
+                break
+            run_rows.append(nxt)
+            j += 1
+
+        if len(run_rows) >= 3:
+            anchor_count = max(2, min(len(run_rows[0]), 5))
+            anchors = [cell.x0 for cell in run_rows[0][:anchor_count]]
+            aligned_rows = 0
+            for candidate_row in run_rows:
+                matches = 0
+                for anchor in anchors:
+                    if any(abs(cell.x0 - anchor) <= 14.0 for cell in candidate_row):
+                        matches += 1
+                if matches >= 2:
+                    aligned_rows += 1
+            if aligned_rows >= max(3, int(len(run_rows) * 0.8)):
+                regions.append(TableRegion(start_row=run_start, end_row=j - 1, column_x=anchors))
+                i = j
+                continue
+        i += 1
+    return regions
+
+
+def render_table_region(rows: List[List[TextLine]], region: TableRegion) -> tuple[float, str]:
+    table_rows = rows[region.start_row : region.end_row + 1]
+    header_cells = sorted(table_rows[0], key=lambda cell: cell.x0)
+    body_rows = table_rows[1:]
+    html_rows: List[str] = ['<table class="pdf-table">', "<thead>", "<tr>"]
+    for cell in header_cells:
+        html_rows.append(f"<th>{html.escape(normalize_text(cell.text))}</th>")
+    html_rows.extend(["</tr>", "</thead>", "<tbody>"])
+    for row in body_rows:
+        sorted_cells = sorted(row, key=lambda cell: cell.x0)
+        html_rows.append("<tr>")
+        for idx in range(len(header_cells)):
+            cell_text = sorted_cells[idx].text if idx < len(sorted_cells) else ""
+            html_rows.append(f"<td>{html.escape(normalize_text(cell_text))}</td>")
+        html_rows.append("</tr>")
+    html_rows.extend(["</tbody>", "</table>"])
+    return table_rows[0][0].y0, "".join(html_rows)
+
+
+def build_list_fragment(items: List[tuple[int, str, bool]]) -> str:
+    if not items:
+        return ""
+    root: List[str] = []
+    stack: List[tuple[int, str, List[str]]] = []
+
+    def close_until(level: int) -> None:
+        nonlocal root, stack
+        while stack and stack[-1][0] >= level:
+            _, list_tag, bucket = stack.pop()
+            fragment = f"<{list_tag}>" + "".join(bucket) + f"</{list_tag}>"
+            if stack:
+                stack[-1][2].append(fragment)
+            else:
+                root.append(fragment)
+
+    for level, text, ordered in items:
+        list_tag = "ol" if ordered else "ul"
+        while stack and stack[-1][0] > level:
+            close_until(stack[-1][0])
+        if not stack or stack[-1][0] < level or stack[-1][1] != list_tag:
+            stack.append((level, list_tag, []))
+        stack[-1][2].append(f"<li>{html.escape(text)}</li>")
+    close_until(-1)
+    return "".join(root)
+
+
+def render_text_blocks_with_lists(blocks: List[TextBlock], page_index: int, total_pages: int, base_indent: float) -> List[Tuple[float, str, str, int | None]]:
+    page_parts: List[Tuple[float, str, str, int | None]] = []
+    list_items: List[tuple[int, str, bool]] = []
+    min_indent = min((block.indent for block in blocks), default=0.0)
+
+    def flush_list(anchor_y: float) -> None:
+        nonlocal list_items
+        if list_items:
+            page_parts.append((anchor_y, "list", build_list_fragment(list_items), None))
+            list_items = []
+
+    for block in blocks:
+        text = block.text
+        if is_bullet_line(text):
+            bullet_prefix, content = strip_bullet_prefix(text)
+            ordered = bool(re.match(r"^(\d+[.)]?|[ivxlcdmIVXLCDM]+\)|\(\d+\)|[a-zA-Z]\))$", bullet_prefix))
+            level = int(max(0, round((block.indent - min_indent) / 18.0)))
+            list_items.append((level, content, ordered))
+            continue
+        flush_list(block.y0)
+        part_type, fragment, start_number = block_to_html(block, page_index, total_pages, base_indent)
+        page_parts.append((block.y0, part_type, fragment, start_number))
+
+    flush_list(blocks[-1].y0 if blocks else 0.0)
+    return page_parts
 
 
 def render_page_parts(page_parts: List[Tuple[float, str, str, int | None]]) -> List[str]:
@@ -478,15 +680,18 @@ def build_semantic_page_html(
     keep_all_images: bool,
     watermark_removal_enabled: bool,
 ) -> Tuple[str, dict]:
-    lines = extract_text_lines(page)
+    raw_rows, lines = extract_text_rows(page)
     blocks = group_lines_into_blocks(lines)
+    table_regions = detect_table_regions(raw_rows)
     images = collect_semantic_images(page, image_counts, keep_all_images, watermark_removal_enabled)
 
     base_indent = sorted(block.indent for block in blocks)[len(blocks) // 2] if blocks else 0.0
-    page_parts: List[Tuple[float, str, str, int | None]] = []
-    for block in blocks:
-        part_type, fragment, start_number = block_to_html(block, page_index, total_pages, base_indent)
-        page_parts.append((block.y0, part_type, fragment, start_number))
+    page_parts: List[Tuple[float, str, str, int | None]] = render_text_blocks_with_lists(
+        blocks, page_index, total_pages, base_indent
+    )
+    for region in table_regions:
+        top, fragment = render_table_region(raw_rows, region)
+        page_parts.append((top, "table", fragment, None))
     page_parts.extend((img.top, "figure", img.html_fragment, None) for img in images)
     page_parts.sort(key=lambda item: item[0])
 
@@ -513,6 +718,7 @@ def build_semantic_page_html(
         "page": page_index,
         "text_lines": len(lines),
         "semantic_blocks": len(blocks),
+        "detected_tables": len(table_regions),
         "embedded_images": len(images),
         "skipped_watermarks": skipped_watermarks,
     }
@@ -699,6 +905,23 @@ def emit_html(doc: fitz.Document, keep_all_images: bool, page_scale: float) -> s
       border-radius: 12px;
       border: 1px solid rgba(17, 24, 39, 0.08);
     }}
+    .semantic-page .pdf-table {{
+      width: 100%;
+      border-collapse: collapse;
+      margin: 14px 0 18px;
+      font-size: 0.96rem;
+    }}
+    .semantic-page .pdf-table th,
+    .semantic-page .pdf-table td {{
+      border: 1px solid rgba(17, 24, 39, 0.14);
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }}
+    .semantic-page .pdf-table thead th {{
+      background: rgba(17, 24, 39, 0.05);
+      font-weight: 600;
+    }}
     @media (max-width: 720px) {{
       .page {{ padding: 24px 20px; border-radius: 16px; }}
       .semantic-page h1 {{ font-size: 1.15rem; }}
@@ -733,6 +956,9 @@ def main() -> None:
     input_pdf = Path(args.input_pdf)
     output_html = Path(args.output_html)
     output_html.parent.mkdir(parents=True, exist_ok=True)
+
+    if fitz is None:
+        raise RuntimeError("PyMuPDF (fitz) is required to convert PDFs. Install it with: pip install pymupdf")
 
     with fitz.open(input_pdf) as doc:
         detection = pdf_has_watermark(doc)
