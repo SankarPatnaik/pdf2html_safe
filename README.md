@@ -1,48 +1,32 @@
 # pdf2html_safe
 
-Convert PDFs into readable, semantic HTML while **safely handling repeated watermark/background images**.
+Convert PDFs into semantic HTML with **document inspection, structural classification, strategy routing, and safe watermark handling**.
 
-This project is designed for legal, administrative, and scanned-style documents where repeated center-page seals/logos can hurt readability in extracted HTML.
+## What changed
 
-## What this tool does
+The conversion flow now runs a document-understanding pass before rendering:
 
-- Extracts text from each PDF page and preserves reading order as much as possible.
-- Builds semantic HTML blocks (headings, paragraphs, tables, blockquotes, signature-like sections, and figure/image wrappers).
-- Detects repeated image assets that look like center-page watermarks.
-- Removes only those probable watermark images by default.
-- Leaves all text content untouched.
-- Writes a single standalone HTML file with embedded styling.
+1. **Inspect (`pdf_inspector`)**: Collect page-level structure signals (text density, headings, bullets, table-like alignment, image density, repeated headers/footers).
+2. **Classify (`pdf_classifier`)**: Categorize document layout (e.g. `legal_judgment`, `table_heavy`, `bullet_heavy`, `mixed_text_image`, `scanned_or_image_heavy`, `watermark_background_pdf`).
+3. **Analyze and reconstruct (`pdf_to_html_safe`)**: Preserve reading order, reconstruct paragraphs/lists/tables/images, and avoid destructive filtering.
+4. **Watermark filtering (`pdf_to_html_safe`)**: Remove only repeated center-overlay image layers when confidence is high.
+5. **Render by approved template (`template_renderer`)**: Reuse the style shell from the approved HTML template file.
 
-## How it works (high-level)
+This keeps the existing implementation but strengthens routing and structure-preservation behavior.
 
-1. Open the PDF using **PyMuPDF**.
-2. Scan image blocks across pages and compute image hashes.
-3. Mark an image as a *watermark candidate* only when it is repeated across pages and matches positional/size heuristics.
-4. Extract text lines/spans and reconstruct logical content rows.
-5. Convert the page content into semantic HTML sections.
-6. Embed a conversion summary in an HTML comment and save the output file.
+## Key guarantees
 
-If no watermark candidate is found, watermark-removal logic is skipped automatically.
+- Content-preserving extraction (no paraphrasing/summarization).
+- Pre-conversion structural inspection and category detection.
+- Strategy routing influenced by detected document category and watermark status.
+- Safer signature-stamp removal (cluster-based, avoids dropping isolated legal text).
+- Output HTML shell/CSS aligned to approved template.
 
 ## Requirements
 
 - Python 3.9+
 - [PyMuPDF](https://pymupdf.readthedocs.io/) (`fitz`) — required
-- [BeautifulSoup4](https://www.crummy.com/software/BeautifulSoup/) — optional (used for prettier/normalized HTML output)
-
-## Installation
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install pymupdf beautifulsoup4
-```
-
-If you only want required dependencies:
-
-```bash
-pip install pymupdf
-```
+- [BeautifulSoup4](https://www.crummy.com/software/BeautifulSoup/) — optional (for prettified HTML)
 
 ## Usage
 
@@ -52,46 +36,29 @@ python pdf_to_html_safe.py <input.pdf> <output.html>
 
 ### Options
 
-- `--keep-all-images`  
-  Keep every image, even if watermark-like images are detected.
-- `--page-scale <float>`  
-  Scale factor from PDF points to CSS pixels. Default is `1.3333` (96/72).
+- `--keep-all-images` — keep all images (disables watermark image skipping effect).
+- `--page-scale <float>` — PDF pt to CSS px scaling factor (default `1.3333`).
+- `--template-html <path>` — approved HTML template to copy style/shell from.
 
-### Examples
-
-Default behavior (safe watermark skipping enabled):
+Example:
 
 ```bash
-python pdf_to_html_safe.py sample.pdf output/sample.html
+python pdf_to_html_safe.py \
+  SAYAJI_HANMAT_BANKAR_vs_STATE_OF_MAHARASHTRA\ \(2\).pdf \
+  output/sayaji.html \
+  --template-html "SAYAJI_HANMAT_BANKAR_semantic_no_watermark (1).html"
 ```
 
-Keep all images (disable watermark filtering effect):
+## Testing
 
 ```bash
-python pdf_to_html_safe.py sample.pdf output/sample_keep_images.html --keep-all-images
+python -m unittest -v
 ```
 
-Custom page scale:
-
-```bash
-python pdf_to_html_safe.py sample.pdf output/sample_scaled.html --page-scale 1.2
-```
-
-## Console output you should expect
-
-After conversion, the script prints one of these statuses:
-
-- `Watermark detected on pages [...]; removal logic applied safely during HTML conversion.`
-- `Watermark detection completed, but --keep-all-images was used, so all images were retained.`
-- `No watermark detected; watermark-removal logic was skipped.`
-
-And then:
-
-- `Created: <output path>`
-
-## Notes and limitations
-
-- The script does not modify your source PDF.
-- Watermark detection is heuristic-based; unusual layouts may require `--keep-all-images`.
-- Best results come from PDFs with an accessible text layer.
-- For purely image-only PDFs, OCR is not included in this repository.
+Tests include:
+- bullet/list heuristics,
+- table detection precision checks,
+- watermark text filtering,
+- signature overlay filtering safeguards,
+- classifier behavior,
+- template style extraction.

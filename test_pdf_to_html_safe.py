@@ -1,5 +1,8 @@
 import unittest
+from pathlib import Path
 
+from pdf_classifier import classify_document
+from pdf_inspector import DocumentProfile, PageSignals
 from pdf_to_html_safe import (
     TableRegion,
     TextBlock,
@@ -13,6 +16,7 @@ from pdf_to_html_safe import (
     is_probable_signature_stamp_text,
     strip_bullet_prefix,
 )
+from template_renderer import extract_template_style
 
 
 class ParserHeuristicTests(unittest.TestCase):
@@ -117,6 +121,14 @@ class ParserHeuristicTests(unittest.TestCase):
         self.assertTrue(is_probable_signature_stamp_text("Date: 2026-03-25 17:47:17 IST"))
         self.assertFalse(is_probable_signature_stamp_text("Date of order is important in this case."))
 
+    def test_isolated_date_line_is_not_removed(self):
+        lines = [
+            self.mk("Date: of order is relevant and discussed below.", 72, 100),
+            self.mk("This line continues the legal analysis.", 72, 112),
+        ]
+        filtered = filter_signature_stamp_lines(lines)
+        self.assertEqual(len(filtered), 2)
+
     def test_keep_continuation_lines_in_same_paragraph(self):
         lines = [
             self.mk("This is a long paragraph that keeps going", 72, 100, y1=112),
@@ -126,6 +138,21 @@ class ParserHeuristicTests(unittest.TestCase):
         blocks = group_lines_into_blocks(lines)
         self.assertEqual(len(blocks), 2)
         self.assertIn("keeps going across lines", blocks[0].text)
+
+    def test_classifier_table_heavy(self):
+        profile = DocumentProfile(
+            page_count=2,
+            pages=[
+                PageSignals(1, 10, 0, 120, 6, 0, 1),
+                PageSignals(2, 10, 0, 110, 6, 0, 1),
+            ],
+        )
+        result = classify_document(profile, watermark_detected=False)
+        self.assertEqual(result.category, "table_heavy")
+
+    def test_template_style_extract(self):
+        style = extract_template_style(Path("SAYAJI_HANMAT_BANKAR_semantic_no_watermark (1).html"))
+        self.assertIn(".doc-shell", style)
 
 
 if __name__ == "__main__":
