@@ -29,6 +29,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+from pdf_classifier import classify_document
+from pdf_inspector import inspect_document
+from template_renderer import extract_template_style, render_document_shell
+
 try:
     import fitz  # PyMuPDF
 except Exception:  # pragma: no cover - allows running heuristic unit tests without PyMuPDF
@@ -41,6 +45,7 @@ except Exception:  # pragma: no cover - graceful fallback
 
 
 PDF_TO_CSS_SCALE = 96.0 / 72.0  # 1 PDF pt = 1.3333 CSS px at 96 dpi
+DEFAULT_TEMPLATE_NAME = "SAYAJI_HANMAT_BANKAR_semantic_no_watermark (1).html"
 
 
 @dataclass
@@ -405,7 +410,19 @@ def is_probable_signature_stamp_text(text: str) -> bool:
 def filter_signature_stamp_lines(lines: List[TextLine]) -> List[TextLine]:
     if not lines:
         return []
-    return [line for line in lines if not is_probable_signature_stamp_text(line.text)]
+    marker_indexes = [idx for idx, line in enumerate(lines) if is_probable_signature_stamp_text(line.text)]
+    if not marker_indexes:
+        return lines
+
+    removable_indexes: set[int] = set()
+    for idx in marker_indexes:
+        neighborhood = lines[max(0, idx - 2) : min(len(lines), idx + 3)]
+        marker_count = sum(1 for item in neighborhood if is_probable_signature_stamp_text(item.text))
+        # Remove only clustered digital-signature overlays; keep isolated "Date:" body content.
+        if marker_count >= 2:
+            removable_indexes.add(idx)
+
+    return [line for idx, line in enumerate(lines) if idx not in removable_indexes]
 
 
 def get_numbered_prefix(text: str) -> tuple[int | None, str]:
@@ -816,10 +833,12 @@ def beautify_html_output(raw_html: str) -> str:
     return raw_html
 
 
-def emit_html(doc: fitz.Document, keep_all_images: bool, page_scale: float) -> str:
+def emit_html(doc: fitz.Document, keep_all_images: bool, page_scale: float, template_path: Path | None = None) -> str:
     image_counts = collect_image_occurrences(doc)
     watermark_detection = pdf_has_watermark(doc)
     watermark_removal_enabled = watermark_detection.found and not keep_all_images
+    profile = inspect_document(doc, extract_text_lines, is_bullet_line)
+    classification = classify_document(profile, watermark_detection.found)
 
     pages_html: List[str] = []
     debug_summary: List[dict] = []
@@ -837,186 +856,47 @@ def emit_html(doc: fitz.Document, keep_all_images: bool, page_scale: float) -> s
         debug_summary.append(page_debug)
 
     title = html.escape(doc.metadata.get("title") or "PDF to HTML")
-    summary_json = html.escape(
-        json.dumps(
-            {
-                "watermark_detected": watermark_detection.found,
-                "watermark_pages": watermark_detection.pages_with_candidates,
-                "repeated_image_count": watermark_detection.repeated_image_count,
-                "candidate_instances": watermark_detection.candidate_instances,
-                "page_summary": debug_summary,
-                "page_scale": page_scale,
+    summary_json = json.dumps(
+        {
+            "classification": {
+                "category": classification.category,
+                "confidence": classification.confidence,
+                "reasons": classification.reasons,
             },
-            indent=2,
-        )
+            "document_profile": {
+                "page_count": profile.page_count,
+                "image_only_pages": profile.image_only_pages,
+                "repeated_headers": profile.repeated_headers,
+                "repeated_footers": profile.repeated_footers,
+            },
+            "watermark_detected": watermark_detection.found,
+            "watermark_pages": watermark_detection.pages_with_candidates,
+            "repeated_image_count": watermark_detection.repeated_image_count,
+            "candidate_instances": watermark_detection.candidate_instances,
+            "page_summary": debug_summary,
+            "page_scale": page_scale,
+        },
+        indent=2,
     )
 
     note = (
-        "Watermark detected. Repeated watermark-style image layers were skipped while keeping the text layer intact."
+        "Watermark detected. Repeated watermark-style image layers were skipped while keeping the text layer intact. "
+        f"Detected category: {classification.category}."
         if watermark_removal_enabled
-        else "No watermark detected. Watermark-removal logic was skipped and the PDF was converted directly to semantic HTML."
+        else "No watermark detected. Watermark-removal logic was skipped and the PDF was converted directly to semantic HTML. "
+        f"Detected category: {classification.category}."
     )
-
-    raw_html = f"""<!doctype html>
-<html lang=\"en\">
-<head>
-  <meta charset=\"utf-8\" />
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-  <title>{title}</title>
-  <style>
-    :root {{
-      --bg: #f3f4f6;
-      --paper: #ffffff;
-      --ink: #111827;
-      --muted: #6b7280;
-      --accent: #1d4ed8;
-      --border: rgba(17, 24, 39, 0.08);
-      --shadow: 0 12px 32px rgba(15, 23, 42, 0.10);
-      --max-width: 920px;
-    }}
-    * {{ box-sizing: border-box; }}
-    html, body {{ margin: 0; padding: 0; }}
-    body {{
-      background: linear-gradient(180deg, #eef2ff 0%, #f8fafc 120px, #f3f4f6 100%);
-      color: var(--ink);
-      font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif;
-      line-height: 1.65;
-      padding: 24px 16px 48px;
-    }}
-    .doc-shell {{
-      max-width: var(--max-width);
-      margin: 0 auto;
-    }}
-    .doc-meta {{
-      margin: 0 auto 20px;
-      padding: 16px 18px;
-      color: var(--muted);
-      font-size: 14px;
-      background: rgba(255, 255, 255, 0.72);
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      backdrop-filter: blur(10px);
-    }}
-    .page-wrap {{
-      max-width: var(--max-width);
-      margin: 0 auto 24px;
-    }}
-    .page-label {{
-      margin: 0 0 8px 4px;
-      color: var(--muted);
-      font-size: 13px;
-      letter-spacing: 0.02em;
-      text-transform: uppercase;
-    }}
-    .page {{
-      background: var(--paper);
-      border: 1px solid var(--border);
-      border-radius: 22px;
-      box-shadow: var(--shadow);
-      padding: 36px 44px;
-    }}
-    .semantic-page h1,
-    .semantic-page h2,
-    .semantic-page p,
-    .semantic-page blockquote,
-    .semantic-page address,
-    .semantic-page figure,
-    .semantic-page ol {{
-      margin: 0 0 14px;
-    }}
-    .semantic-page h1 {{
-      font-size: 1.35rem;
-      line-height: 1.35;
-      text-align: center;
-      color: #111827;
-      letter-spacing: 0.03em;
-      text-transform: uppercase;
-    }}
-    .semantic-page h2 {{
-      font-size: 1.05rem;
-      line-height: 1.4;
-      text-align: center;
-      color: #111827;
-      letter-spacing: 0.02em;
-      text-transform: uppercase;
-    }}
-    .semantic-page p {{
-      font-size: 1rem;
-      color: #111827;
-      text-align: justify;
-      text-indent: 0;
-    }}
-    .semantic-page .section-list {{
-      padding-left: 1.55rem;
-    }}
-    .semantic-page .section-list li {{
-      padding-left: 0.2rem;
-      margin-bottom: 0.45rem;
-      text-align: justify;
-    }}
-    .semantic-page blockquote {{
-      margin-left: 26px;
-      padding-left: 16px;
-      border-left: 3px solid rgba(29, 78, 216, 0.18);
-      color: #1f2937;
-      background: rgba(37, 99, 235, 0.03);
-      border-radius: 0 10px 10px 0;
-      padding-top: 10px;
-      padding-bottom: 10px;
-    }}
-    .semantic-page .signature-block {{
-      white-space: pre-line;
-      font-style: normal;
-      color: #111827;
-      margin-top: 22px;
-    }}
-    .semantic-page .image-block {{
-      margin: 18px 0;
-      text-align: center;
-    }}
-    .semantic-page .image-block img {{
-      max-width: 100%;
-      height: auto;
-      border-radius: 12px;
-      border: 1px solid rgba(17, 24, 39, 0.08);
-    }}
-    .semantic-page .pdf-table {{
-      width: 100%;
-      border-collapse: collapse;
-      margin: 14px 0 18px;
-      font-size: 0.96rem;
-    }}
-    .semantic-page .pdf-table th,
-    .semantic-page .pdf-table td {{
-      border: 1px solid rgba(17, 24, 39, 0.14);
-      padding: 8px 10px;
-      text-align: left;
-      vertical-align: top;
-    }}
-    .semantic-page .pdf-table thead th {{
-      background: rgba(17, 24, 39, 0.05);
-      font-weight: 600;
-    }}
-    @media (max-width: 720px) {{
-      .page {{ padding: 24px 20px; border-radius: 16px; }}
-      .semantic-page h1 {{ font-size: 1.15rem; }}
-      .semantic-page h2 {{ font-size: 1rem; }}
-      .semantic-page p {{ font-size: 0.98rem; }}
-      .semantic-page blockquote {{ margin-left: 12px; padding-left: 12px; }}
-    }}
-  </style>
-</head>
-<body>
-  <main class=\"doc-shell\">
-    <div class=\"doc-meta\">{html.escape(note)}</div>
-    {''.join(pages_html)}
-  </main>
-  <!-- conversion-summary
-  {summary_json}
-  -->
-</body>
-</html>
-"""
+    style_template_path = template_path if template_path else Path(DEFAULT_TEMPLATE_NAME)
+    style_css = extract_template_style(style_template_path)
+    if not style_css:
+        style_css = extract_template_style(Path(DEFAULT_TEMPLATE_NAME))
+    raw_html = render_document_shell(
+        title=title,
+        note=note,
+        pages_html="".join(pages_html),
+        summary_json=summary_json,
+        style_css=style_css,
+    )
     return beautify_html_output(raw_html)
 
 
@@ -1026,6 +906,11 @@ def main() -> None:
     parser.add_argument("output_html", help="Path to output HTML")
     parser.add_argument("--keep-all-images", action="store_true", help="Embed all images, even if they look like repeated watermarks")
     parser.add_argument("--page-scale", type=float, default=PDF_TO_CSS_SCALE, help="Scale factor from PDF points to CSS pixels")
+    parser.add_argument(
+        "--template-html",
+        default=DEFAULT_TEMPLATE_NAME,
+        help="Path to approved HTML template. CSS/layout shell is copied from this file.",
+    )
     args = parser.parse_args()
 
     input_pdf = Path(args.input_pdf)
@@ -1037,7 +922,12 @@ def main() -> None:
 
     with fitz.open(input_pdf) as doc:
         detection = pdf_has_watermark(doc)
-        html_text = emit_html(doc, keep_all_images=args.keep_all_images, page_scale=args.page_scale)
+        html_text = emit_html(
+            doc,
+            keep_all_images=args.keep_all_images,
+            page_scale=args.page_scale,
+            template_path=Path(args.template_html),
+        )
 
     output_html.write_text(html_text, encoding="utf-8")
 
