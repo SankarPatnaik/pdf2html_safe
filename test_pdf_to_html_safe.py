@@ -6,6 +6,7 @@ from pdf_to_html_safe import (
     TextLine,
     build_list_fragment,
     detect_table_regions,
+    filter_probable_watermark_text_lines,
     group_lines_into_blocks,
     is_bullet_line,
     strip_bullet_prefix,
@@ -73,6 +74,26 @@ class ParserHeuristicTests(unittest.TestCase):
         self.assertIn("<ul>", frag)
         self.assertIn("<li>Root</li>", frag)
         self.assertIn("<li>Child</li>", frag)
+
+    def test_filter_rotated_overlay_watermark_text(self):
+        body_1 = self.mk("The issue involved also is common which pertains", 72, 300, y1=314, size=12)
+        body_2 = self.mk("to the valuation of goods sold by the assessee", 72, 312, y1=326, size=12)
+        watermark = TextLine(
+            text="JUDGMENT",
+            x0=150,
+            y0=306,
+            x1=420,
+            y1=340,
+            font_name="Times-Bold",
+            font_size=24,
+            page_width=600,
+            page_height=800,
+            dir_x=0.75,
+            dir_y=0.65,
+        )
+
+        filtered = filter_probable_watermark_text_lines([body_1, watermark, body_2])
+        self.assertEqual([line.text for line in filtered], [body_1.text, body_2.text])
 
 
 if __name__ == "__main__":

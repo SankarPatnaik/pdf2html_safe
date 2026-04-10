@@ -54,6 +54,8 @@ class TextLine:
     font_size: float
     page_width: float
     page_height: float
+    dir_x: float = 1.0
+    dir_y: float = 0.0
 
     @property
     def left(self) -> float:
@@ -265,6 +267,7 @@ def extract_text_lines(page: fitz.Page) -> List[TextLine]:
                 continue
             first_span = spans[0]
             x0, y0, x1, y1 = line["bbox"]
+            dir_x, dir_y = line.get("dir", (1.0, 0.0))
             physical_lines.append(
                 TextLine(
                     text=text,
@@ -276,9 +279,12 @@ def extract_text_lines(page: fitz.Page) -> List[TextLine]:
                     font_size=float(first_span.get("size", 12.0)),
                     page_width=float(page.rect.width),
                     page_height=float(page.rect.height),
+                    dir_x=float(dir_x),
+                    dir_y=float(dir_y),
                 )
             )
 
+    physical_lines = filter_probable_watermark_text_lines(physical_lines)
     logical_rows = merge_physical_lines_to_logical_rows(physical_lines)
     logical_rows.sort(key=lambda item: (round(item.y0, 1), round(item.x0, 1)))
     return logical_rows
@@ -301,6 +307,7 @@ def extract_text_rows(page: fitz.Page) -> tuple[List[List[TextLine]], List[TextL
                 continue
             first_span = spans[0]
             x0, y0, x1, y1 = line["bbox"]
+            dir_x, dir_y = line.get("dir", (1.0, 0.0))
             physical_lines.append(
                 TextLine(
                     text=text,
@@ -312,9 +319,12 @@ def extract_text_rows(page: fitz.Page) -> tuple[List[List[TextLine]], List[TextL
                     font_size=float(first_span.get("size", 12.0)),
                     page_width=float(page.rect.width),
                     page_height=float(page.rect.height),
+                    dir_x=float(dir_x),
+                    dir_y=float(dir_y),
                 )
             )
 
+    physical_lines = filter_probable_watermark_text_lines(physical_lines)
     rows = group_physical_lines_by_row(physical_lines)
     logical_rows = [merge_row_segments(row) for row in rows]
     logical_rows.sort(key=lambda item: (round(item.y0, 1), round(item.x0, 1)))
@@ -336,6 +346,42 @@ def merge_line_text(parts: List[str]) -> str:
         else:
             out += " " + current
     return normalize_text(out)
+
+
+def _vertical_overlap_amount(a: TextLine, b: TextLine) -> float:
+    return max(0.0, min(a.y1, b.y1) - max(a.y0, b.y0))
+
+
+def filter_probable_watermark_text_lines(lines: List[TextLine]) -> List[TextLine]:
+    if not lines:
+        return []
+
+    ordered_sizes = sorted(line.font_size for line in lines)
+    median_size = ordered_sizes[len(ordered_sizes) // 2]
+    watermark_tokens = {"JUDGMENT", "JUDGEMENT", "SUPREMECOURTOFINDIA", "GOVERNMENTOFINDIA"}
+
+    kept: List[TextLine] = []
+    for line in lines:
+        text_compact = re.sub(r"[^A-Za-z]", "", line.text).upper()
+        is_upper_short = 5 <= len(text_compact) <= 40 and line.uppercase_ratio >= 0.85
+        looks_rotated = abs(line.dir_y) >= 0.18
+        looks_large = line.font_size >= max(14.0, median_size * 1.35)
+        explicit_watermark_word = text_compact in watermark_tokens
+        overlap_count = sum(
+            1
+            for other in lines
+            if other is not line and _vertical_overlap_amount(line, other) >= max(2.0, min(line.height, other.height) * 0.2)
+        )
+        looks_overlay = overlap_count >= 2
+
+        if looks_overlay and (
+            (looks_rotated and is_upper_short and line.is_centered)
+            or (explicit_watermark_word and line.is_centered and (looks_large or looks_rotated))
+        ):
+            continue
+
+        kept.append(line)
+    return kept
 
 
 def get_numbered_prefix(text: str) -> tuple[int | None, str]:
