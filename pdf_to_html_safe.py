@@ -285,6 +285,7 @@ def extract_text_lines(page: fitz.Page) -> List[TextLine]:
             )
 
     physical_lines = filter_probable_watermark_text_lines(physical_lines)
+    physical_lines = filter_signature_stamp_lines(physical_lines)
     logical_rows = merge_physical_lines_to_logical_rows(physical_lines)
     logical_rows.sort(key=lambda item: (round(item.y0, 1), round(item.x0, 1)))
     return logical_rows
@@ -325,6 +326,7 @@ def extract_text_rows(page: fitz.Page) -> tuple[List[List[TextLine]], List[TextL
             )
 
     physical_lines = filter_probable_watermark_text_lines(physical_lines)
+    physical_lines = filter_signature_stamp_lines(physical_lines)
     rows = group_physical_lines_by_row(physical_lines)
     logical_rows = [merge_row_segments(row) for row in rows]
     logical_rows.sort(key=lambda item: (round(item.y0, 1), round(item.x0, 1)))
@@ -382,6 +384,28 @@ def filter_probable_watermark_text_lines(lines: List[TextLine]) -> List[TextLine
 
         kept.append(line)
     return kept
+
+
+def is_probable_signature_stamp_text(text: str) -> bool:
+    normalized = normalize_text(text)
+    compact_lower = re.sub(r"\s+", " ", normalized).lower()
+    compact_upper = compact_lower.upper()
+
+    if compact_upper.startswith("SIGNATURE NOT VERIFIED"):
+        return True
+    if compact_lower.startswith("digitally signed by "):
+        return True
+    if compact_lower.startswith("signed by "):
+        return True
+    if compact_lower.startswith("date:") and re.search(r"\d{4}[./-]\d{1,2}[./-]\d{1,2}", compact_lower):
+        return True
+    return False
+
+
+def filter_signature_stamp_lines(lines: List[TextLine]) -> List[TextLine]:
+    if not lines:
+        return []
+    return [line for line in lines if not is_probable_signature_stamp_text(line.text)]
 
 
 def get_numbered_prefix(text: str) -> tuple[int | None, str]:
@@ -476,10 +500,15 @@ def group_lines_into_blocks(lines: List[TextLine]) -> List[TextBlock]:
         current_is_numbered = is_numbered_paragraph_start(line.text)
         prev_is_numbered = is_numbered_paragraph_start(prev.text)
         prev_is_short_byline = len(prev.text) <= 40 and (prev.text.endswith('J.') or prev.text.endswith(',J.') or prev.text.endswith('J.,'))
+        prev_sentence_continues = bool(prev.text) and prev.text[-1] not in ".!?:;"
+        line_starts_lower_or_digit = bool(line.text) and (line.text[0].islower() or line.text[0].isdigit())
+        continuation_hint = prev_sentence_continues and (
+            line_starts_lower_or_digit or indent_delta <= max(prev.font_size * 1.35, 16.0)
+        )
         likely_new_block = (
             current_is_numbered
             or is_bullet_line(line.text)
-            or vertical_gap > max(prev.font_size * 1.15, 10.0)
+            or (vertical_gap > max(prev.font_size * 1.45, 14.0) and not continuation_hint)
             or font_delta > 1.8
             or (line.x0 - prev.x0) > max(prev.font_size * 1.35, 14.0)
             or (indent_delta > max(prev.font_size * 6.0, 72.0) and prev_is_numbered)

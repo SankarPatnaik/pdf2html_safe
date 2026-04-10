@@ -7,8 +7,10 @@ from pdf_to_html_safe import (
     build_list_fragment,
     detect_table_regions,
     filter_probable_watermark_text_lines,
+    filter_signature_stamp_lines,
     group_lines_into_blocks,
     is_bullet_line,
+    is_probable_signature_stamp_text,
     strip_bullet_prefix,
 )
 
@@ -94,6 +96,36 @@ class ParserHeuristicTests(unittest.TestCase):
 
         filtered = filter_probable_watermark_text_lines([body_1, watermark, body_2])
         self.assertEqual([line.text for line in filtered], [body_1.text, body_2.text])
+
+    def test_filter_signature_stamp_lines(self):
+        lines = [
+            self.mk("This is body content.", 72, 100),
+            self.mk("Signature Not Verified", 72, 112),
+            self.mk("Digitally signed by Jayant Kumar Arora", 72, 124),
+            self.mk("Date: 2026.03.25 17:47:17 IST", 72, 136),
+            self.mk("Continuation of body paragraph.", 72, 148),
+        ]
+        filtered = filter_signature_stamp_lines(lines)
+        self.assertEqual(
+            [line.text for line in filtered],
+            ["This is body content.", "Continuation of body paragraph."],
+        )
+
+    def test_signature_stamp_matcher(self):
+        self.assertTrue(is_probable_signature_stamp_text("Signature Not Verified"))
+        self.assertTrue(is_probable_signature_stamp_text("Digitally signed by Jane Doe"))
+        self.assertTrue(is_probable_signature_stamp_text("Date: 2026-03-25 17:47:17 IST"))
+        self.assertFalse(is_probable_signature_stamp_text("Date of order is important in this case."))
+
+    def test_keep_continuation_lines_in_same_paragraph(self):
+        lines = [
+            self.mk("This is a long paragraph that keeps going", 72, 100, y1=112),
+            self.mk("across lines in PDF extraction and should merge.", 74, 116, y1=128),
+            self.mk("This starts a new paragraph.", 72, 150, y1=162),
+        ]
+        blocks = group_lines_into_blocks(lines)
+        self.assertEqual(len(blocks), 2)
+        self.assertIn("keeps going across lines", blocks[0].text)
 
 
 if __name__ == "__main__":
