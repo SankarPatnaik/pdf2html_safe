@@ -137,21 +137,20 @@ DEFAULT_LEGAL_CSS = """
   article.page.semantic-page {
     box-sizing: border-box;
     width: var(--a4-width);
-    min-height: var(--a4-height);
-    height: auto;
+    height: var(--a4-height);
     background: #fff;
     border: 1px solid #222;
     border-radius: 0;
     box-shadow: none;
     display: grid;
-    grid-template-rows: auto 1fr auto;
+    grid-template-rows: 12mm 1fr 10mm;
     padding: var(--legal-margin-top) var(--legal-margin-right) var(--legal-margin-bottom) var(--legal-margin-left);
-    overflow: visible;
+    overflow: hidden;
   }
-  .page-header { min-height: 2mm; }
-  .page-body { min-height: 0; overflow: visible; }
-  .page-footer { min-height: 8mm; display: flex; align-items: flex-end; justify-content: center; }
-  .page-number { font-size: 0.83rem; color: #111; }
+  .page-header { min-height: 0; }
+  .page-body { min-height: 0; overflow: hidden; align-self: stretch; }
+  .page-footer { min-height: 0; display: flex; align-items: flex-end; justify-content: center; }
+  .page-folio { font-size: 0.83rem; color: #111; min-height: 1.2em; }
   .semantic-page p, .semantic-page li, .semantic-page blockquote { margin: 0.22rem 0 0.48rem; }
   .semantic-page h1, .semantic-page h2, .semantic-page h3 { margin: 0.8rem 0 0.4rem; font-weight: 600; }
   .semantic-page blockquote { margin-left: 1.4rem; border-left: 2px solid #888; padding-left: 0.8rem; }
@@ -163,7 +162,7 @@ DEFAULT_LEGAL_CSS = """
   @media print {
     body { font-size: 11pt; }
     .doc-shell { max-width: none; padding: 0; }
-    article.page.semantic-page { border: none; width: auto; height: auto; min-height: calc(var(--a4-height) - 32mm); page-break-after: always; }
+    article.page.semantic-page { border: none; width: auto; height: auto; min-height: calc(var(--a4-height) - 32mm); page-break-after: always; overflow: visible; }
     section.page-wrap { page-break-inside: avoid; }
     table, figure, blockquote, ol, ul { page-break-inside: avoid; }
   }
@@ -370,6 +369,19 @@ class HeaderFooterProfile:
     repeated_zone_text: Set[str]
 
 
+@dataclass
+class PageLayout:
+    source_page_index: int
+    source_page_number: int
+    source_page_folio: str | None
+    page_classification: str
+    header_footer_suppressed: int
+    rendered_parts: List[str]
+    skipped_watermarks: int
+    has_images: bool
+    is_truly_blank_source_page: bool
+
+
 def _canonical_header_footer_text(text: str) -> str:
     canonical = normalize_text(text).lower()
     canonical = re.sub(r"\bpage\s+\d+\b", "page #", canonical)
@@ -397,6 +409,47 @@ def _is_footer_noise_pattern(text: str) -> bool:
         or compact.startswith("reason:")
         or bool(re.match(r"^date:\s*\d{4}[./-]\d{1,2}[./-]\d{1,2}", compact))
     )
+
+
+FOLIO_CANDIDATE_PATTERN = re.compile(r"^(?:\(?\s*[A-Za-z]{0,4}\s*[-./]?\s*)?([ivxlcdmIVXLCDM]+|\d{1,5})(?:\s*[-./]?\s*[A-Za-z]{0,4}\s*\)?)?$")
+
+
+def _extract_folio_token(text: str) -> str | None:
+    compact = normalize_text(text)
+    if not compact or len(compact) > 24:
+        return None
+    compact = compact.strip("[]{}")
+    match = FOLIO_CANDIDATE_PATTERN.fullmatch(compact)
+    if not match:
+        return None
+    return compact
+
+
+def extract_source_page_folio(lines: List[TextLine]) -> str | None:
+    zone_candidates: List[TextLine] = []
+    for line in lines:
+        zone = _line_zone(line)
+        if zone == "body":
+            continue
+        token = _extract_folio_token(line.text)
+        if token is None:
+            continue
+        if is_probable_signature_stamp_text(line.text):
+            continue
+        zone_candidates.append(line)
+
+    if not zone_candidates:
+        return None
+
+    # Prefer bottom-center folios which are common in Indian court PDFs.
+    zone_candidates.sort(
+        key=lambda item: (
+            0 if _line_zone(item) == "bottom" else 1,
+            abs(item.center_x - (item.page_width / 2.0)),
+            len(normalize_text(item.text)),
+        )
+    )
+    return normalize_text(zone_candidates[0].text)
 
 
 def build_header_footer_profile(doc: fitz.Document) -> HeaderFooterProfile:
@@ -931,9 +984,50 @@ def collect_semantic_images(
     return images
 
 
-def build_semantic_page_html(
+def _estimate_fragment_height(fragment: str) -> float:
+    plain = re.sub(r"<[^>]+>", " ", fragment)
+    plain = normalize_text(html.unescape(plain))
+    if not plain:
+        return 0.0
+    return max(12.0, min(180.0, 10.0 + len(plain) * 0.22))
+
+
+def rebalance_rendered_parts(rendered_parts: List[str]) -> List[str]:
+    if len(rendered_parts) < 2:
+        return rendered_parts
+    first = rendered_parts[0]
+    second = rendered_parts[1]
+    if "<p" not in first or "<p" not in second:
+        return rendered_parts
+    first_text = normalize_text(html.unescape(re.sub(r"<[^>]+>", " ", first)))
+    second_text = normalize_text(html.unescape(re.sub(r"<[^>]+>", " ", second)))
+    if not first_text or not second_text:
+        return rendered_parts
+    if first_text[-1:] in ".!?:;" or not (second_text[:1].islower() or second_text.lower().startswith(("and ", "or ", "but "))):
+        return rendered_parts
+    merged = re.sub(
+        r"</p>\s*$",
+        f" {html.escape(second_text)}</p>",
+        first,
+    )
+    return [merged] + rendered_parts[2:]
+
+
+def _has_meaningful_content(fragments: List[str]) -> bool:
+    for fragment in fragments:
+        if any(tag in fragment for tag in ("<p", "<h1", "<h2", "<h3", "<li", "<table", "<figure", "<address", "<blockquote")):
+            text = normalize_text(html.unescape(re.sub(r"<[^>]+>", " ", fragment)))
+            if text:
+                return True
+            if "<figure" in fragment or "<table" in fragment:
+                return True
+    return False
+
+
+def build_semantic_page_layout(
     page: fitz.Page,
-    page_index: int,
+    page_number: int,
+    source_page_index: int,
     total_pages: int,
     image_counts: Counter,
     keep_all_images: bool,
@@ -941,8 +1035,9 @@ def build_semantic_page_html(
     header_footer_profile: HeaderFooterProfile,
     prev_page_tail: str | None = None,
     carry_list_number: int | None = None,
-) -> Tuple[str, dict, int | None]:
+) -> Tuple[PageLayout, dict, int | None]:
     raw_rows, lines = extract_text_rows(page)
+    source_page_folio = extract_source_page_folio(lines)
     lines, suppressed_count = suppress_header_footer_lines(lines, header_footer_profile)
     raw_rows = group_physical_lines_by_row(lines)
     blocks = group_lines_into_blocks(lines)
@@ -951,7 +1046,7 @@ def build_semantic_page_html(
 
     base_indent = sorted(block.indent for block in blocks)[len(blocks) // 2] if blocks else 0.0
     page_parts: List[Tuple[float, str, str, int | None]] = render_text_blocks_with_lists(
-        blocks, page_index, total_pages, base_indent, prev_page_tail=prev_page_tail
+        blocks, page_number, total_pages, base_indent, prev_page_tail=prev_page_tail
     )
     for region in table_regions:
         top, fragment = render_table_region(raw_rows, region)
@@ -974,24 +1069,16 @@ def build_semantic_page_html(
     elif images:
         page_class = "mixed_text_image"
 
-    page_html = [
-        f'<section class="page-wrap" data-source-page="{page_index}" data-page-classification="{page_class}" data-header-footer-suppressed="{"true" if suppressed_count else "false"}">',
-        f'  <article class="page semantic-page" data-source-page="{page_index}">',
-        '    <header class="page-header" aria-hidden="true"></header>',
-        '    <div class="page-body">',
-    ]
     rendered_parts, next_list_number = render_page_parts(page_parts, carry_list_number=carry_list_number)
-    for fragment in rendered_parts:
-        page_html.append(f"    {fragment}")
-    page_html.extend([
-        '    </div>',
-        f'    <footer class="page-footer"><div class="page-number" data-page-number="{page_index}">Page {page_index}</div></footer>',
-        '  </article>',
-        '</section>',
-    ])
+    rendered_parts = rebalance_rendered_parts(rendered_parts)
+    estimated_content_height = sum(_estimate_fragment_height(fragment) for fragment in rendered_parts)
+    is_truly_blank_source_page = len(lines) == 0 and len(images) == 0
+    meaningful_content = _has_meaningful_content(rendered_parts)
 
     debug_info = {
-        "page": page_index,
+        "page": page_number,
+        "source_page_index": source_page_index,
+        "source_page_folio": source_page_folio,
         "page_classification": page_class,
         "text_lines": len(lines),
         "semantic_blocks": len(blocks),
@@ -1001,8 +1088,25 @@ def build_semantic_page_html(
         "ocr_used": 0,
         "preserved_image_regions": len(images),
         "header_footer_suppressed": suppressed_count,
+        "estimated_content_height": estimated_content_height,
+        "meaningful_content": meaningful_content,
+        "is_truly_blank_source_page": is_truly_blank_source_page,
     }
-    return "\n".join(page_html), debug_info, next_list_number
+    return (
+        PageLayout(
+            source_page_index=source_page_index,
+            source_page_number=page_number,
+            source_page_folio=source_page_folio,
+            page_classification=page_class,
+            header_footer_suppressed=suppressed_count,
+            rendered_parts=rendered_parts,
+            skipped_watermarks=skipped_watermarks,
+            has_images=bool(images),
+            is_truly_blank_source_page=is_truly_blank_source_page,
+        ),
+        debug_info,
+        next_list_number,
+    )
 
 
 def merge_cross_page_paragraphs(pages_html: List[str]) -> List[str]:
@@ -1038,6 +1142,35 @@ def merge_cross_page_paragraphs(pages_html: List[str]) -> List[str]:
     return merged
 
 
+def render_page_layout_html(page: PageLayout) -> str:
+    folio_attr = html.escape(page.source_page_folio) if page.source_page_folio is not None else ""
+    folio_html = html.escape(page.source_page_folio) if page.source_page_folio is not None else ""
+    page_html = [
+        (
+            f'<section class="page-wrap" data-source-page-index="{page.source_page_index}" '
+            f'data-source-page-folio="{folio_attr}" data-page-classification="{page.page_classification}" '
+            f'data-header-footer-suppressed="{"true" if page.header_footer_suppressed else "false"}">'
+        ),
+        (
+            f'  <article class="page semantic-page" data-source-page-index="{page.source_page_index}" '
+            f'data-source-page-number="{page.source_page_number}">'
+        ),
+        '    <header class="page-header" aria-hidden="true"></header>',
+        '    <div class="page-body">',
+    ]
+    for fragment in page.rendered_parts:
+        page_html.append(f"    {fragment}")
+    page_html.extend(
+        [
+            '    </div>',
+            f'    <footer class="page-footer"><div class="page-folio" data-source-page-folio="{folio_attr}">{folio_html}</div></footer>',
+            "  </article>",
+            "</section>",
+        ]
+    )
+    return "\n".join(page_html)
+
+
 # ---------------------------------------------------------------------------
 # Requested new function #2: beautify final HTML and keep semantic structure.
 # ---------------------------------------------------------------------------
@@ -1062,15 +1195,17 @@ def emit_html(doc: fitz.Document, keep_all_images: bool, page_scale: float, temp
     classification = classify_document(profile, watermark_detection.found)
     header_footer_profile = build_header_footer_profile(doc)
 
-    pages_html: List[str] = []
+    page_layouts: List[PageLayout] = []
     debug_summary: List[dict] = []
     prev_page_tail: str | None = None
     carry_list_number: int | None = None
 
-    for page_index, page in enumerate(doc, start=1):
-        page_html, page_debug, carry_list_number = build_semantic_page_html(
+    for source_page_index, page in enumerate(doc):
+        page_number = source_page_index + 1
+        page_layout, page_debug, carry_list_number = build_semantic_page_layout(
             page=page,
-            page_index=page_index,
+            page_number=page_number,
+            source_page_index=source_page_index,
             total_pages=len(doc),
             image_counts=image_counts,
             keep_all_images=keep_all_images,
@@ -1079,12 +1214,20 @@ def emit_html(doc: fitz.Document, keep_all_images: bool, page_scale: float, temp
             prev_page_tail=prev_page_tail,
             carry_list_number=carry_list_number,
         )
-        pages_html.append(page_html)
+        page_layouts.append(page_layout)
         debug_summary.append(page_debug)
         tail_lines = _extract_page_lines(page)
         tail_lines, _ = suppress_header_footer_lines(tail_lines, header_footer_profile)
         prev_page_tail = normalize_text(tail_lines[-1].text) if tail_lines else None
 
+    filtered_layouts: List[PageLayout] = []
+    for layout in page_layouts:
+        meaningful = _has_meaningful_content(layout.rendered_parts)
+        if not meaningful and not layout.is_truly_blank_source_page and not layout.has_images:
+            continue
+        filtered_layouts.append(layout)
+
+    pages_html = [render_page_layout_html(layout) for layout in filtered_layouts]
     pages_html = merge_cross_page_paragraphs(pages_html)
     page_classification_counts = Counter(item["page_classification"] for item in debug_summary)
     title = html.escape(doc.metadata.get("title") or "PDF to HTML")
