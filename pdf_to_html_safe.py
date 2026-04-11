@@ -137,7 +137,8 @@ DEFAULT_LEGAL_CSS = """
   article.page.semantic-page {
     box-sizing: border-box;
     width: var(--a4-width);
-    height: var(--a4-height);
+    min-height: var(--a4-height);
+    height: auto;
     background: #fff;
     border: 1px solid #222;
     border-radius: 0;
@@ -145,10 +146,10 @@ DEFAULT_LEGAL_CSS = """
     display: grid;
     grid-template-rows: auto 1fr auto;
     padding: var(--legal-margin-top) var(--legal-margin-right) var(--legal-margin-bottom) var(--legal-margin-left);
-    overflow: hidden;
+    overflow: visible;
   }
   .page-header { min-height: 2mm; }
-  .page-body { min-height: 0; overflow: hidden; }
+  .page-body { min-height: 0; overflow: visible; }
   .page-footer { min-height: 8mm; display: flex; align-items: flex-end; justify-content: center; }
   .page-number { font-size: 0.83rem; color: #111; }
   .semantic-page p, .semantic-page li, .semantic-page blockquote { margin: 0.22rem 0 0.48rem; }
@@ -860,22 +861,27 @@ def render_text_blocks_with_lists(
     return page_parts
 
 
-def render_page_parts(page_parts: List[Tuple[float, str, str, int | None]]) -> List[str]:
+def render_page_parts(
+    page_parts: List[Tuple[float, str, str, int | None]],
+    carry_list_number: int | None = None,
+) -> Tuple[List[str], int | None]:
     rendered: List[str] = []
     active_list_number: int | None = None
     list_items: List[str] = []
+    next_list_number: int | None = carry_list_number
 
     def flush_list() -> None:
-        nonlocal active_list_number, list_items
+        nonlocal active_list_number, list_items, next_list_number
         if list_items:
             rendered.append(f'<ol start="{active_list_number}" class="section-list">' + ''.join(list_items) + '</ol>')
+            next_list_number = (active_list_number or 1) + len(list_items)
             list_items = []
             active_list_number = None
 
     for _, part_type, fragment, start_number in page_parts:
         if part_type == 'li':
             if active_list_number is None:
-                active_list_number = start_number or 1
+                active_list_number = start_number or carry_list_number or 1
             elif start_number is not None and start_number != (active_list_number + len(list_items)):
                 flush_list()
                 active_list_number = start_number
@@ -885,7 +891,7 @@ def render_page_parts(page_parts: List[Tuple[float, str, str, int | None]]) -> L
             rendered.append(fragment)
 
     flush_list()
-    return rendered
+    return rendered, next_list_number
 
 
 def collect_semantic_images(
@@ -934,7 +940,8 @@ def build_semantic_page_html(
     watermark_removal_enabled: bool,
     header_footer_profile: HeaderFooterProfile,
     prev_page_tail: str | None = None,
-) -> Tuple[str, dict]:
+    carry_list_number: int | None = None,
+) -> Tuple[str, dict, int | None]:
     raw_rows, lines = extract_text_rows(page)
     lines, suppressed_count = suppress_header_footer_lines(lines, header_footer_profile)
     raw_rows = group_physical_lines_by_row(lines)
@@ -973,7 +980,8 @@ def build_semantic_page_html(
         '    <header class="page-header" aria-hidden="true"></header>',
         '    <div class="page-body">',
     ]
-    for fragment in render_page_parts(page_parts):
+    rendered_parts, next_list_number = render_page_parts(page_parts, carry_list_number=carry_list_number)
+    for fragment in rendered_parts:
         page_html.append(f"    {fragment}")
     page_html.extend([
         '    </div>',
@@ -994,7 +1002,7 @@ def build_semantic_page_html(
         "preserved_image_regions": len(images),
         "header_footer_suppressed": suppressed_count,
     }
-    return "\n".join(page_html), debug_info
+    return "\n".join(page_html), debug_info, next_list_number
 
 
 def merge_cross_page_paragraphs(pages_html: List[str]) -> List[str]:
@@ -1057,9 +1065,10 @@ def emit_html(doc: fitz.Document, keep_all_images: bool, page_scale: float, temp
     pages_html: List[str] = []
     debug_summary: List[dict] = []
     prev_page_tail: str | None = None
+    carry_list_number: int | None = None
 
     for page_index, page in enumerate(doc, start=1):
-        page_html, page_debug = build_semantic_page_html(
+        page_html, page_debug, carry_list_number = build_semantic_page_html(
             page=page,
             page_index=page_index,
             total_pages=len(doc),
@@ -1068,6 +1077,7 @@ def emit_html(doc: fitz.Document, keep_all_images: bool, page_scale: float, temp
             watermark_removal_enabled=watermark_removal_enabled,
             header_footer_profile=header_footer_profile,
             prev_page_tail=prev_page_tail,
+            carry_list_number=carry_list_number,
         )
         pages_html.append(page_html)
         debug_summary.append(page_debug)
