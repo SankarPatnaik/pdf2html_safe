@@ -13,6 +13,9 @@ from pdf_to_html_safe import (
     filter_probable_watermark_text_lines,
     filter_signature_stamp_lines,
     group_lines_into_blocks,
+    merge_cross_page_paragraphs,
+    suppress_header_footer_lines,
+    HeaderFooterProfile,
     is_bullet_line,
     is_probable_signature_stamp_text,
     resolve_input_pdfs,
@@ -140,6 +143,32 @@ class ParserHeuristicTests(unittest.TestCase):
         blocks = group_lines_into_blocks(lines)
         self.assertEqual(len(blocks), 2)
         self.assertIn("keeps going across lines", blocks[0].text)
+
+    def test_suppress_page_number_and_signature_footer(self):
+        lines = [
+            self.mk("Main body text.", 72, 400, y1=412),
+            self.mk("Signature Not Verified", 72, 760, y1=772),
+            self.mk("Reason:", 72, 775, y1=787),
+            self.mk("4", 300, 785, y1=797),
+        ]
+        profile = HeaderFooterProfile(repeated_zone_text=set())
+        kept, suppressed = suppress_header_footer_lines(lines, profile)
+        self.assertEqual([line.text for line in kept], ["Main body text."])
+        self.assertEqual(suppressed, 3)
+
+    def test_cross_page_merge_continuation(self):
+        page_1 = """
+<section class="page-wrap"><article class="page semantic-page"><div class="page-body">
+<p data-source-page="4">in the cooperative</p>
+</div><footer></footer></article></section>
+"""
+        page_2 = """
+<section class="page-wrap"><article class="page semantic-page"><div class="page-body">
+<p data-source-page="5">sector and consumed by himself for such industry.</p>
+</div><footer></footer></article></section>
+"""
+        merged = merge_cross_page_paragraphs([page_1, page_2])
+        self.assertIn("in the cooperative sector and consumed by himself for such industry.", merged[0])
 
     def test_classifier_table_heavy(self):
         profile = DocumentProfile(
