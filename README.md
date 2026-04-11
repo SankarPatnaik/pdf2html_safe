@@ -14,6 +14,20 @@ The conversion flow now runs a document-understanding pass before rendering:
 
 This keeps the existing implementation but strengthens routing and structure-preservation behavior.
 
+## Legal judgment enhancement scope
+
+The pipeline now targets Indian Supreme Court / High Court judgment fidelity with:
+
+- semantic legal block metadata (`data-source-page`, extraction method, confidence, block role),
+- page-level class hints (`native_text`, `mixed_text_image`, `scanned_text`, `table_heavy`),
+- cross-page paragraph continuation merge safeguards,
+- explicit conversion-summary counters aligned with legal review/audit workflows,
+- fallback restrained CSS with A4 print rules when template CSS is missing.
+
+A formal implementation and output contract is documented in:
+
+- `LEGAL_PIPELINE_SPEC.md`
+
 ## Key guarantees
 
 - Content-preserving extraction (no paraphrasing/summarization).

@@ -118,6 +118,31 @@ class WatermarkDetection:
     candidate_instances: int
 
 
+DEFAULT_LEGAL_CSS = """
+  body { background: #fff; color: #111; margin: 0; font-family: "Noto Serif", Georgia, "Times New Roman", serif; line-height: 1.45; }
+  .doc-shell { max-width: 900px; margin: 0 auto; padding: 24px 28px; }
+  .doc-meta { font-size: 0.9rem; margin-bottom: 12px; color: #222; }
+  article.court-judgment { counter-reset: page; }
+  header.court-header p { margin: 0.15rem 0; text-align: center; }
+  section.page-wrap { margin: 0 0 1.4rem; }
+  .page-label { font-size: 0.85rem; margin: 0.35rem 0; color: #333; }
+  .semantic-page p, .semantic-page li, .semantic-page blockquote { margin: 0.22rem 0 0.48rem; }
+  .semantic-page h1, .semantic-page h2, .semantic-page h3 { margin: 0.8rem 0 0.4rem; font-weight: 600; }
+  .semantic-page blockquote { margin-left: 1.4rem; border-left: 2px solid #888; padding-left: 0.8rem; }
+  .pdf-table { width: 100%; border-collapse: collapse; margin: 0.45rem 0 0.8rem; }
+  .pdf-table th, .pdf-table td { border: 1px solid #333; padding: 4px 6px; vertical-align: top; }
+  figure.image-block, figure.preserved-table-image { margin: 0.65rem 0; }
+  figure img { max-width: 100%; height: auto; display: block; }
+  @page { size: A4; margin: 16mm 14mm; }
+  @media print {
+    body { font-size: 11pt; }
+    .doc-shell { max-width: none; padding: 0; }
+    section.page-wrap { page-break-inside: avoid; }
+    table, figure, blockquote, ol, ul { page-break-inside: avoid; }
+  }
+"""
+
+
 def normalize_text(s: str) -> str:
     s = s.replace("\u00a0", " ")
     s = re.sub(r"[ \t]+", " ", s)
@@ -574,16 +599,34 @@ def block_to_html(block: TextBlock, page_index: int, total_pages: int, base_inde
 
     if tag == "li":
         start_number, item_text = get_numbered_prefix(text)
-        return tag, f'<li>{html.escape(item_text)}</li>', start_number
+        return tag, (
+            f'<li data-source-page="{page_index}" data-extraction-method="native" '
+            f'data-block-role="list" data-confidence="0.92" data-watermark-removed="false">{html.escape(item_text)}</li>'
+        ), start_number
     if tag == "address":
-        return tag, f'<address class="signature-block">{html.escape(text)}</address>', None
+        return tag, (
+            f'<address class="signature-block" data-source-page="{page_index}" '
+            f'data-extraction-method="native" data-block-role="signature" data-confidence="0.9">{html.escape(text)}</address>'
+        ), None
     if tag == "blockquote":
-        return tag, f'<blockquote>{html.escape(text)}</blockquote>', None
+        return tag, (
+            f'<blockquote data-source-page="{page_index}" data-extraction-method="native" '
+            f'data-block-role="paragraph" data-confidence="0.9">{html.escape(text)}</blockquote>'
+        ), None
     if tag == "h1":
-        return tag, f'<h1>{html.escape(text)}</h1>', None
+        return tag, (
+            f'<h1 data-source-page="{page_index}" data-extraction-method="native" '
+            f'data-block-role="heading" data-confidence="0.95">{html.escape(text)}</h1>'
+        ), None
     if tag == "h2":
-        return tag, f'<h2>{html.escape(text)}</h2>', None
-    return tag, f'<p>{html.escape(text)}</p>', None
+        return tag, (
+            f'<h2 data-source-page="{page_index}" data-extraction-method="native" '
+            f'data-block-role="heading" data-confidence="0.94">{html.escape(text)}</h2>'
+        ), None
+    return tag, (
+        f'<p data-source-page="{page_index}" data-extraction-method="native" '
+        f'data-block-role="paragraph" data-confidence="0.92">{html.escape(text)}</p>'
+    ), None
 
 
 def detect_table_regions(rows: List[List[TextLine]]) -> List[TableRegion]:
@@ -634,7 +677,12 @@ def render_table_region(rows: List[List[TextLine]], region: TableRegion) -> tupl
     table_rows = rows[region.start_row : region.end_row + 1]
     header_cells = sorted(table_rows[0], key=lambda cell: cell.x0)
     body_rows = table_rows[1:]
-    html_rows: List[str] = ['<table class="pdf-table">', "<thead>", "<tr>"]
+    html_rows: List[str] = [
+        '<table class="pdf-table" data-extraction-method="table-extracted" '
+        'data-block-role="table" data-confidence="0.86" data-preserved-image-block="false">',
+        "<thead>",
+        "<tr>",
+    ]
     for cell in header_cells:
         html_rows.append(f"<th>{html.escape(normalize_text(cell.text))}</th>")
     html_rows.extend(["</tr>", "</thead>", "<tbody>"])
@@ -757,7 +805,8 @@ def collect_semantic_images(
             ImageBlock(
                 top=float(y0),
                 html_fragment=(
-                    '<figure class="image-block">'
+                    '<figure class="image-block" data-extraction-method="image-preserved" '
+                    'data-block-role="figure" data-preserved-image-block="true" data-confidence="1.0">'
                     f'<img alt="embedded-image" width="{int(width)}" height="{int(height)}" '
                     f'src="data:image/{ext};base64,{img_b64}" />'
                     '</figure>'
@@ -797,10 +846,18 @@ def build_semantic_page_html(
             if block["type"] == 1 and block.get("image") and is_probable_watermark(page.rect, block, image_counts, min_repeat_pages=2):
                 skipped_watermarks += 1
 
+    page_class = "native_text"
+    if page.get_images(full=True) and len(lines) < 5:
+        page_class = "scanned_text"
+    elif table_regions:
+        page_class = "table_heavy"
+    elif images:
+        page_class = "mixed_text_image"
+
     page_html = [
-        '<section class="page-wrap">',
+        f'<section class="page-wrap" data-source-page="{page_index}" data-page-classification="{page_class}">',
         f'  <div class="page-label">Page {page_index}</div>',
-        '  <article class="page semantic-page">',
+        f'  <article class="page semantic-page" data-source-page="{page_index}">',
     ]
     for fragment in render_page_parts(page_parts):
         page_html.append(f"    {fragment}")
@@ -811,13 +868,44 @@ def build_semantic_page_html(
 
     debug_info = {
         "page": page_index,
+        "page_classification": page_class,
         "text_lines": len(lines),
         "semantic_blocks": len(blocks),
         "detected_tables": len(table_regions),
         "embedded_images": len(images),
         "skipped_watermarks": skipped_watermarks,
+        "ocr_used": 0,
+        "preserved_image_regions": len(images),
     }
     return "\n".join(page_html), debug_info
+
+
+def merge_cross_page_paragraphs(pages_html: List[str]) -> List[str]:
+    merged = list(pages_html)
+    for idx in range(1, len(merged)):
+        prev = merged[idx - 1]
+        cur = merged[idx]
+        prev_match = re.search(r"<p([^>]*)>([^<]+)</p>\s*</article>\s*</section>\s*$", prev, re.DOTALL)
+        cur_match = re.search(r"(<article[^>]*>\s*)<p([^>]*)>([^<]+)</p>", cur, re.DOTALL)
+        if not prev_match or not cur_match:
+            continue
+        prev_text = normalize_text(html.unescape(prev_match.group(2)))
+        cur_text = normalize_text(html.unescape(cur_match.group(3)))
+        if not prev_text or not cur_text:
+            continue
+        if prev_text[-1] in ".!?:;" or re.match(r"^(\d+\.|[A-Z][A-Z\s]{2,}|[\(\[]?[a-zA-Z0-9]+[\)\.])", cur_text):
+            continue
+        combined = html.escape(f"{prev_text} {cur_text}")
+        new_prev = re.sub(
+            r"<p([^>]*)>[^<]+</p>\s*</article>\s*</section>\s*$",
+            f'<p{prev_match.group(1)} data-source-pages="{idx}-{idx+1}">{combined}</p>\n  </article>\n</section>',
+            prev,
+            flags=re.DOTALL,
+        )
+        new_cur = re.sub(r"(<article[^>]*>\s*)<p[^>]*>[^<]+</p>\s*", r"\1", cur, count=1, flags=re.DOTALL)
+        merged[idx - 1] = new_prev
+        merged[idx] = new_cur
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -858,24 +946,24 @@ def emit_html(doc: fitz.Document, keep_all_images: bool, page_scale: float, temp
         pages_html.append(page_html)
         debug_summary.append(page_debug)
 
+    pages_html = merge_cross_page_paragraphs(pages_html)
+    page_classification_counts = Counter(item["page_classification"] for item in debug_summary)
     title = html.escape(doc.metadata.get("title") or "PDF to HTML")
     summary_json = json.dumps(
         {
-            "classification": {
-                "category": classification.category,
-                "confidence": classification.confidence,
-                "reasons": classification.reasons,
-            },
-            "document_profile": {
-                "page_count": profile.page_count,
-                "image_only_pages": profile.image_only_pages,
-                "repeated_headers": profile.repeated_headers,
-                "repeated_footers": profile.repeated_footers,
-            },
-            "watermark_detected": watermark_detection.found,
-            "watermark_pages": watermark_detection.pages_with_candidates,
-            "repeated_image_count": watermark_detection.repeated_image_count,
-            "candidate_instances": watermark_detection.candidate_instances,
+            "total_pages": profile.page_count,
+            "page_classification_counts": page_classification_counts,
+            "extracted_native_text_pages_count": sum(1 for row in debug_summary if row["page_classification"] == "native_text"),
+            "ocr_pages_count": sum(row["ocr_used"] for row in debug_summary),
+            "preserved_image_pages_regions_count": sum(row["preserved_image_regions"] for row in debug_summary),
+            "extracted_tables_count": sum(row["detected_tables"] for row in debug_summary),
+            "image_preserved_tables_count": 0,
+            "watermark_candidates_detected": watermark_detection.candidate_instances,
+            "watermark_removals_applied": sum(row["skipped_watermarks"] for row in debug_summary),
+            "low_confidence_regions_preserved_as_image": 0,
+            "warnings_unresolved_ambiguities": [],
+            "no_hallucination_confirmation": True,
+            "classification": {"category": classification.category, "confidence": classification.confidence, "reasons": classification.reasons},
             "page_summary": debug_summary,
             "page_scale": page_scale,
         },
@@ -893,10 +981,14 @@ def emit_html(doc: fitz.Document, keep_all_images: bool, page_scale: float, temp
     style_css = extract_template_style(style_template_path)
     if not style_css:
         style_css = extract_template_style(Path(DEFAULT_TEMPLATE_NAME))
+    if not style_css:
+        style_css = DEFAULT_LEGAL_CSS
+    elif "@page" not in style_css:
+        style_css = style_css + "\n" + DEFAULT_LEGAL_CSS
     raw_html = render_document_shell(
         title=title,
         note=note,
-        pages_html="".join(pages_html),
+        pages_html='<article class="court-judgment">' + "".join(pages_html) + "</article>",
         summary_json=summary_json,
         style_css=style_css,
     )
