@@ -14,8 +14,11 @@ from pdf_to_html_safe import (
     filter_signature_stamp_lines,
     group_lines_into_blocks,
     merge_cross_page_paragraphs,
+    extract_source_page_folio,
+    render_page_layout_html,
     suppress_header_footer_lines,
     HeaderFooterProfile,
+    PageLayout,
     is_bullet_line,
     is_probable_signature_stamp_text,
     resolve_input_pdfs,
@@ -155,6 +158,32 @@ class ParserHeuristicTests(unittest.TestCase):
         kept, suppressed = suppress_header_footer_lines(lines, profile)
         self.assertEqual([line.text for line in kept], ["Main body text."])
         self.assertEqual(suppressed, 3)
+
+    def test_extract_source_page_folio_preserves_printed_number(self):
+        lines = [
+            self.mk("Main body text.", 72, 420, y1=432),
+            self.mk("127", 292, 785, x1=308, y1=797),
+            self.mk("Signature Not Verified", 72, 760, y1=772),
+        ]
+        self.assertEqual(extract_source_page_folio(lines), "127")
+
+    def test_render_page_layout_uses_folio_not_synthetic_page_number(self):
+        layout = PageLayout(
+            source_page_index=3,
+            source_page_number=4,
+            source_page_folio="127",
+            page_classification="native_text",
+            header_footer_suppressed=0,
+            rendered_parts=['<p data-source-page="4">Text</p>'],
+            skipped_watermarks=0,
+            has_images=False,
+            is_truly_blank_source_page=False,
+        )
+        rendered = render_page_layout_html(layout)
+        self.assertIn('data-source-page-index="3"', rendered)
+        self.assertIn('data-source-page-folio="127"', rendered)
+        self.assertIn('<div class="page-folio" data-source-page-folio="127">127</div>', rendered)
+        self.assertNotIn("Page 4", rendered)
 
     def test_cross_page_merge_continuation(self):
         page_1 = """
