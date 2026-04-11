@@ -8,12 +8,14 @@ from pdf_to_html_safe import (
     TextBlock,
     TextLine,
     build_list_fragment,
+    choose_conversion_backend,
     detect_table_regions,
     filter_probable_watermark_text_lines,
     filter_signature_stamp_lines,
     group_lines_into_blocks,
     is_bullet_line,
     is_probable_signature_stamp_text,
+    resolve_input_pdfs,
     strip_bullet_prefix,
 )
 from template_renderer import extract_template_style
@@ -153,6 +155,16 @@ class ParserHeuristicTests(unittest.TestCase):
     def test_template_style_extract(self):
         style = extract_template_style(Path("SAYAJI_HANMAT_BANKAR_semantic_no_watermark (1).html"))
         self.assertIn(".doc-shell", style)
+
+    def test_backend_router_auto(self):
+        self.assertEqual(choose_conversion_backend("table_heavy", "auto"), "pdf2htmlex")
+        self.assertEqual(choose_conversion_backend("legal_judgment", "auto"), "semantic")
+        self.assertEqual(choose_conversion_backend("legal_judgment", "pdf2htmlex"), "pdf2htmlex")
+
+    def test_resolve_pdf_glob(self):
+        matches = resolve_input_pdfs("*.pdf")
+        self.assertTrue(matches)
+        self.assertTrue(all(path.suffix.lower() == ".pdf" for path in matches))
 
 
 if __name__ == "__main__":

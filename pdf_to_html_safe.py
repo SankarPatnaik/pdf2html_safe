@@ -24,6 +24,8 @@ import hashlib
 import html
 import json
 import re
+import shutil
+import subprocess
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +48,7 @@ except Exception:  # pragma: no cover - graceful fallback
 
 PDF_TO_CSS_SCALE = 96.0 / 72.0  # 1 PDF pt = 1.3333 CSS px at 96 dpi
 DEFAULT_TEMPLATE_NAME = "SAYAJI_HANMAT_BANKAR_semantic_no_watermark (1).html"
+PDF2HTMLEX_REFERENCE = "https://github.com/pdf2htmlex/pdf2htmlex"
 
 
 @dataclass
@@ -900,12 +903,63 @@ def emit_html(doc: fitz.Document, keep_all_images: bool, page_scale: float, temp
     return beautify_html_output(raw_html)
 
 
+def choose_conversion_backend(classification_category: str, preferred_backend: str) -> str:
+    if preferred_backend in {"semantic", "pdf2htmlex"}:
+        return preferred_backend
+    if classification_category in {"table_heavy", "scanned_or_image_heavy", "mixed_text_image"}:
+        return "pdf2htmlex"
+    return "semantic"
+
+
+def run_pdf2htmlex_conversion(input_pdf: Path, output_html: Path, page_scale: float) -> tuple[bool, str]:
+    binary = shutil.which("pdf2htmlEX")
+    if not binary:
+        return False, "pdf2htmlEX binary was not found in PATH."
+
+    zoom = max(1.0, page_scale)
+    command = [
+        binary,
+        "--embed", "cfijo",
+        "--dest-dir", str(output_html.parent),
+        "--zoom", f"{zoom:.4f}",
+        "--font-size-multiplier", "1",
+        str(input_pdf),
+        output_html.name,
+    ]
+    try:
+        completed = subprocess.run(command, check=False, capture_output=True, text=True)
+    except OSError as exc:
+        return False, f"pdf2htmlEX failed to start: {exc}"
+
+    if completed.returncode != 0:
+        details = (completed.stderr or completed.stdout or "").strip()
+        return False, f"pdf2htmlEX failed with exit code {completed.returncode}: {details}"
+    return True, f"Converted with pdf2htmlEX ({PDF2HTMLEX_REFERENCE})."
+
+
+def resolve_input_pdfs(input_value: str) -> List[Path]:
+    candidate = Path(input_value)
+    if candidate.exists():
+        return [candidate]
+    matches = sorted(Path().glob(input_value))
+    return [path for path in matches if path.is_file() and path.suffix.lower() == ".pdf"]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Convert PDF to semantic HTML while safely skipping repeated watermark images.")
-    parser.add_argument("input_pdf", help="Path to source PDF")
-    parser.add_argument("output_html", help="Path to output HTML")
+    parser.add_argument("input_pdf", help="Path/glob to source PDF(s), e.g. '*.pdf'")
+    parser.add_argument("output_html", help="Path to output HTML for single PDF, or directory for multiple PDFs")
     parser.add_argument("--keep-all-images", action="store_true", help="Embed all images, even if they look like repeated watermarks")
     parser.add_argument("--page-scale", type=float, default=PDF_TO_CSS_SCALE, help="Scale factor from PDF points to CSS pixels")
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "semantic", "pdf2htmlex"],
+        default="auto",
+        help=(
+            "Conversion backend. "
+            "'auto' routes table-heavy / mixed-image PDFs to pdf2htmlEX (if available), otherwise uses semantic parser."
+        ),
+    )
     parser.add_argument(
         "--template-html",
         default=DEFAULT_TEMPLATE_NAME,
@@ -913,35 +967,54 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    input_pdf = Path(args.input_pdf)
-    output_html = Path(args.output_html)
-    output_html.parent.mkdir(parents=True, exist_ok=True)
+    input_pdfs = resolve_input_pdfs(args.input_pdf)
+    if not input_pdfs:
+        raise FileNotFoundError(f"No PDF files found for input: {args.input_pdf}")
+
+    output_target = Path(args.output_html)
+    multiple_inputs = len(input_pdfs) > 1
+    if multiple_inputs:
+        output_target.mkdir(parents=True, exist_ok=True)
+    else:
+        output_target.parent.mkdir(parents=True, exist_ok=True)
 
     if fitz is None:
         raise RuntimeError("PyMuPDF (fitz) is required to convert PDFs. Install it with: pip install pymupdf")
 
-    with fitz.open(input_pdf) as doc:
-        detection = pdf_has_watermark(doc)
-        html_text = emit_html(
-            doc,
-            keep_all_images=args.keep_all_images,
-            page_scale=args.page_scale,
-            template_path=Path(args.template_html),
-        )
+    for input_pdf in input_pdfs:
+        output_html = output_target / f"{input_pdf.stem}.html" if multiple_inputs else output_target
+        with fitz.open(input_pdf) as doc:
+            detection = pdf_has_watermark(doc)
+            profile = inspect_document(doc, extract_text_lines, is_bullet_line)
+            classification = classify_document(profile, detection.found)
+            selected_backend = choose_conversion_backend(classification.category, args.backend)
 
-    output_html.write_text(html_text, encoding="utf-8")
+            if selected_backend == "pdf2htmlex":
+                success, message = run_pdf2htmlex_conversion(input_pdf, output_html, args.page_scale)
+                if success:
+                    print(f"[{input_pdf.name}] {message}")
+                    continue
+                print(f"[{input_pdf.name}] {message} Falling back to semantic backend.")
 
-    if detection.found and not args.keep_all_images:
-        print(
-            "Watermark detected on pages "
-            f"{detection.pages_with_candidates}; removal logic applied safely during HTML conversion."
-        )
-    elif args.keep_all_images:
-        print("Watermark detection completed, but --keep-all-images was used, so all images were retained.")
-    else:
-        print("No watermark detected; watermark-removal logic was skipped.")
+            html_text = emit_html(
+                doc,
+                keep_all_images=args.keep_all_images,
+                page_scale=args.page_scale,
+                template_path=Path(args.template_html),
+            )
+            output_html.write_text(html_text, encoding="utf-8")
 
-    print(f"Created: {output_html}")
+        if detection.found and not args.keep_all_images:
+            print(
+                f"[{input_pdf.name}] Watermark detected on pages "
+                f"{detection.pages_with_candidates}; removal logic applied safely during HTML conversion."
+            )
+        elif args.keep_all_images:
+            print(f"[{input_pdf.name}] Watermark detection completed, but --keep-all-images was used, so all images were retained.")
+        else:
+            print(f"[{input_pdf.name}] No watermark detected; watermark-removal logic was skipped.")
+
+        print(f"Created: {output_html}")
 
 
 if __name__ == "__main__":
