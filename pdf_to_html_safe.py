@@ -28,8 +28,9 @@ import shutil
 import subprocess
 from collections import Counter
 from dataclasses import dataclass
+from math import ceil
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
 from pdf_classifier import classify_document
 from pdf_inspector import inspect_document
@@ -119,13 +120,37 @@ class WatermarkDetection:
 
 
 DEFAULT_LEGAL_CSS = """
+  :root {
+    --a4-width: 210mm;
+    --a4-height: 297mm;
+    --legal-margin-top: 16mm;
+    --legal-margin-right: 14mm;
+    --legal-margin-bottom: 16mm;
+    --legal-margin-left: 14mm;
+  }
   body { background: #fff; color: #111; margin: 0; font-family: "Noto Serif", Georgia, "Times New Roman", serif; line-height: 1.45; }
-  .doc-shell { max-width: 900px; margin: 0 auto; padding: 24px 28px; }
+  .doc-shell { max-width: none; margin: 0 auto; padding: 8mm 0 10mm; }
   .doc-meta { font-size: 0.9rem; margin-bottom: 12px; color: #222; }
-  article.court-judgment { counter-reset: page; }
+  article.court-judgment { counter-reset: page; display: flex; flex-direction: column; align-items: center; gap: 6mm; }
   header.court-header p { margin: 0.15rem 0; text-align: center; }
-  section.page-wrap { margin: 0 0 1.4rem; }
-  .page-label { font-size: 0.85rem; margin: 0.35rem 0; color: #333; }
+  section.page-wrap { width: var(--a4-width); margin: 0; }
+  article.page.semantic-page {
+    box-sizing: border-box;
+    width: var(--a4-width);
+    height: var(--a4-height);
+    background: #fff;
+    border: 1px solid #222;
+    border-radius: 0;
+    box-shadow: none;
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    padding: var(--legal-margin-top) var(--legal-margin-right) var(--legal-margin-bottom) var(--legal-margin-left);
+    overflow: hidden;
+  }
+  .page-header { min-height: 2mm; }
+  .page-body { min-height: 0; overflow: hidden; }
+  .page-footer { min-height: 8mm; display: flex; align-items: flex-end; justify-content: center; }
+  .page-number { font-size: 0.83rem; color: #111; }
   .semantic-page p, .semantic-page li, .semantic-page blockquote { margin: 0.22rem 0 0.48rem; }
   .semantic-page h1, .semantic-page h2, .semantic-page h3 { margin: 0.8rem 0 0.4rem; font-weight: 600; }
   .semantic-page blockquote { margin-left: 1.4rem; border-left: 2px solid #888; padding-left: 0.8rem; }
@@ -137,10 +162,13 @@ DEFAULT_LEGAL_CSS = """
   @media print {
     body { font-size: 11pt; }
     .doc-shell { max-width: none; padding: 0; }
+    article.page.semantic-page { border: none; width: auto; height: auto; min-height: calc(var(--a4-height) - 32mm); page-break-after: always; }
     section.page-wrap { page-break-inside: avoid; }
     table, figure, blockquote, ol, ul { page-break-inside: avoid; }
   }
 """
+
+HEADING_KEYWORDS = {"JUDGMENT", "JUDGEMENT", "FACTS", "ANALYSIS", "ISSUE", "ISSUES", "ORDER", "CONCLUSION", "DECISION"}
 
 
 def normalize_text(s: str) -> str:
@@ -283,7 +311,7 @@ def group_physical_lines_by_row(lines: List[TextLine]) -> List[List[TextLine]]:
     return rows
 
 
-def extract_text_lines(page: fitz.Page) -> List[TextLine]:
+def _extract_page_lines(page: fitz.Page) -> List[TextLine]:
     page_dict = page.get_text("dict")
     physical_lines: List[TextLine] = []
 
@@ -324,46 +352,97 @@ def extract_text_lines(page: fitz.Page) -> List[TextLine]:
     return logical_rows
 
 
+def extract_text_lines(page: fitz.Page) -> List[TextLine]:
+    return _extract_page_lines(page)
+
+
 def extract_text_rows(page: fitz.Page) -> tuple[List[List[TextLine]], List[TextLine]]:
-    page_dict = page.get_text("dict")
-    physical_lines: List[TextLine] = []
-
-    for block in page_dict["blocks"]:
-        if block["type"] != 0:
-            continue
-        for line in block.get("lines", []):
-            spans = line.get("spans", [])
-            if not spans:
-                continue
-            raw_text = "".join(span.get("text", "") for span in spans)
-            text = normalize_text(raw_text)
-            if not text:
-                continue
-            first_span = spans[0]
-            x0, y0, x1, y1 = line["bbox"]
-            dir_x, dir_y = line.get("dir", (1.0, 0.0))
-            physical_lines.append(
-                TextLine(
-                    text=text,
-                    x0=float(x0),
-                    y0=float(y0),
-                    x1=float(x1),
-                    y1=float(y1),
-                    font_name=str(first_span.get("font", "")),
-                    font_size=float(first_span.get("size", 12.0)),
-                    page_width=float(page.rect.width),
-                    page_height=float(page.rect.height),
-                    dir_x=float(dir_x),
-                    dir_y=float(dir_y),
-                )
-            )
-
-    physical_lines = filter_probable_watermark_text_lines(physical_lines)
-    physical_lines = filter_signature_stamp_lines(physical_lines)
+    physical_lines = _extract_page_lines(page)
     rows = group_physical_lines_by_row(physical_lines)
     logical_rows = [merge_row_segments(row) for row in rows]
     logical_rows.sort(key=lambda item: (round(item.y0, 1), round(item.x0, 1)))
     return rows, logical_rows
+
+
+@dataclass
+class HeaderFooterProfile:
+    repeated_zone_text: Set[str]
+
+
+def _canonical_header_footer_text(text: str) -> str:
+    canonical = normalize_text(text).lower()
+    canonical = re.sub(r"\bpage\s+\d+\b", "page #", canonical)
+    canonical = re.sub(r"\d+", "#", canonical)
+    return canonical
+
+
+def _line_zone(line: TextLine) -> str:
+    top_ratio = line.y0 / max(line.page_height, 1.0)
+    bottom_ratio = line.y1 / max(line.page_height, 1.0)
+    if top_ratio <= 0.12:
+        return "top"
+    if bottom_ratio >= 0.88:
+        return "bottom"
+    return "body"
+
+
+def _is_footer_noise_pattern(text: str) -> bool:
+    compact = normalize_text(text).lower()
+    return bool(
+        re.fullmatch(r"\d{1,4}", compact)
+        or compact.startswith("signature not verified")
+        or compact.startswith("digitally signed by")
+        or compact.startswith("signed by ")
+        or compact.startswith("reason:")
+        or bool(re.match(r"^date:\s*\d{4}[./-]\d{1,2}[./-]\d{1,2}", compact))
+    )
+
+
+def build_header_footer_profile(doc: fitz.Document) -> HeaderFooterProfile:
+    total_pages = max(len(doc), 1)
+    repeat_threshold = max(3, ceil(total_pages * 0.35))
+    by_canonical: Dict[str, dict] = {}
+
+    for page_no, page in enumerate(doc, start=1):
+        page_lines = _extract_page_lines(page)
+        for line in page_lines:
+            zone = _line_zone(line)
+            if zone == "body":
+                continue
+            canonical = _canonical_header_footer_text(line.text)
+            if not canonical:
+                continue
+            entry = by_canonical.setdefault(canonical, {"pages": set(), "top": 0, "bottom": 0})
+            entry["pages"].add(page_no)
+            if zone == "top":
+                entry["top"] += 1
+            else:
+                entry["bottom"] += 1
+
+    repeated_zone_text: Set[str] = set()
+    for canonical, entry in by_canonical.items():
+        page_hits = len(entry["pages"])
+        zone_consistent = max(entry["top"], entry["bottom"]) >= max(2, ceil(page_hits * 0.75))
+        if page_hits >= repeat_threshold and zone_consistent and len(canonical) <= 130:
+            repeated_zone_text.add(canonical)
+
+    return HeaderFooterProfile(repeated_zone_text=repeated_zone_text)
+
+
+def suppress_header_footer_lines(lines: List[TextLine], profile: HeaderFooterProfile) -> tuple[List[TextLine], int]:
+    kept: List[TextLine] = []
+    suppressed = 0
+    for line in lines:
+        zone = _line_zone(line)
+        canonical = _canonical_header_footer_text(line.text)
+        pattern_match = _is_footer_noise_pattern(line.text)
+        repeated_zone = canonical in profile.repeated_zone_text
+        page_number_artifact = bool(re.fullmatch(r"\d{1,4}", normalize_text(line.text))) and zone != "body"
+        if page_number_artifact or (pattern_match and zone != "body") or (repeated_zone and zone != "body"):
+            suppressed += 1
+            continue
+        kept.append(line)
+    return kept, suppressed
 
 
 def merge_line_text(parts: List[str]) -> str:
@@ -572,7 +651,13 @@ def group_lines_into_blocks(lines: List[TextLine]) -> List[TextBlock]:
     return blocks
 
 
-def classify_block_tag(block: TextBlock, page_index: int, total_pages: int, base_indent: float) -> str:
+def classify_block_tag(
+    block: TextBlock,
+    page_index: int,
+    total_pages: int,
+    base_indent: float,
+    prev_tail: str | None = None,
+) -> str:
     text = block.text
     text_len = len(text)
 
@@ -580,9 +665,20 @@ def classify_block_tag(block: TextBlock, page_index: int, total_pages: int, base
         return "li"
     if page_index == total_pages and (".J." in text or text.startswith("New Delhi")):
         return "address"
+    if prev_tail and prev_tail[-1:] not in ".!?:;" and text[:1].islower():
+        return "p"
     if block.is_centered and block.uppercase_ratio >= 0.72 and text_len <= 110:
         return "h1" if page_index == 1 else "h2"
-    if block.is_centered and text_len <= 80 and block.avg_font_size >= 12:
+    semantic_heading_hit = any(word in text.upper() for word in HEADING_KEYWORDS)
+    if (
+        semantic_heading_hit
+        and block.is_centered
+        and text_len <= 100
+        and block.avg_font_size >= 11.0
+        and block.uppercase_ratio >= 0.45
+        and (not prev_tail or prev_tail[-1:] in ".!?:;")
+        and not text[:1].islower()
+    ):
         return "h2"
     if (text.startswith("Exception") or text.startswith("Provided") or text.startswith("Provided that")) and text_len >= 30:
         return "blockquote"
@@ -593,8 +689,14 @@ def classify_block_tag(block: TextBlock, page_index: int, total_pages: int, base
     return "p"
 
 
-def block_to_html(block: TextBlock, page_index: int, total_pages: int, base_indent: float) -> tuple[str, str, int | None]:
-    tag = classify_block_tag(block, page_index, total_pages, base_indent)
+def block_to_html(
+    block: TextBlock,
+    page_index: int,
+    total_pages: int,
+    base_indent: float,
+    prev_tail: str | None = None,
+) -> tuple[str, str, int | None]:
+    tag = classify_block_tag(block, page_index, total_pages, base_indent, prev_tail=prev_tail)
     text = block.text
 
     if tag == "li":
@@ -724,7 +826,13 @@ def build_list_fragment(items: List[tuple[int, str, bool]]) -> str:
     return "".join(root)
 
 
-def render_text_blocks_with_lists(blocks: List[TextBlock], page_index: int, total_pages: int, base_indent: float) -> List[Tuple[float, str, str, int | None]]:
+def render_text_blocks_with_lists(
+    blocks: List[TextBlock],
+    page_index: int,
+    total_pages: int,
+    base_indent: float,
+    prev_page_tail: str | None = None,
+) -> List[Tuple[float, str, str, int | None]]:
     page_parts: List[Tuple[float, str, str, int | None]] = []
     list_items: List[tuple[int, str, bool]] = []
     min_indent = min((block.indent for block in blocks), default=0.0)
@@ -735,7 +843,7 @@ def render_text_blocks_with_lists(blocks: List[TextBlock], page_index: int, tota
             page_parts.append((anchor_y, "list", build_list_fragment(list_items), None))
             list_items = []
 
-    for block in blocks:
+    for idx, block in enumerate(blocks):
         text = block.text
         if is_bullet_line(text):
             bullet_prefix, content = strip_bullet_prefix(text)
@@ -744,7 +852,8 @@ def render_text_blocks_with_lists(blocks: List[TextBlock], page_index: int, tota
             list_items.append((level, content, ordered))
             continue
         flush_list(block.y0)
-        part_type, fragment, start_number = block_to_html(block, page_index, total_pages, base_indent)
+        prev_tail = prev_page_tail if idx == 0 else None
+        part_type, fragment, start_number = block_to_html(block, page_index, total_pages, base_indent, prev_tail=prev_tail)
         page_parts.append((block.y0, part_type, fragment, start_number))
 
     flush_list(blocks[-1].y0 if blocks else 0.0)
@@ -823,15 +932,19 @@ def build_semantic_page_html(
     image_counts: Counter,
     keep_all_images: bool,
     watermark_removal_enabled: bool,
+    header_footer_profile: HeaderFooterProfile,
+    prev_page_tail: str | None = None,
 ) -> Tuple[str, dict]:
     raw_rows, lines = extract_text_rows(page)
+    lines, suppressed_count = suppress_header_footer_lines(lines, header_footer_profile)
+    raw_rows = group_physical_lines_by_row(lines)
     blocks = group_lines_into_blocks(lines)
     table_regions = detect_table_regions(raw_rows)
     images = collect_semantic_images(page, image_counts, keep_all_images, watermark_removal_enabled)
 
     base_indent = sorted(block.indent for block in blocks)[len(blocks) // 2] if blocks else 0.0
     page_parts: List[Tuple[float, str, str, int | None]] = render_text_blocks_with_lists(
-        blocks, page_index, total_pages, base_indent
+        blocks, page_index, total_pages, base_indent, prev_page_tail=prev_page_tail
     )
     for region in table_regions:
         top, fragment = render_table_region(raw_rows, region)
@@ -855,13 +968,16 @@ def build_semantic_page_html(
         page_class = "mixed_text_image"
 
     page_html = [
-        f'<section class="page-wrap" data-source-page="{page_index}" data-page-classification="{page_class}">',
-        f'  <div class="page-label">Page {page_index}</div>',
+        f'<section class="page-wrap" data-source-page="{page_index}" data-page-classification="{page_class}" data-header-footer-suppressed="{"true" if suppressed_count else "false"}">',
         f'  <article class="page semantic-page" data-source-page="{page_index}">',
+        '    <header class="page-header" aria-hidden="true"></header>',
+        '    <div class="page-body">',
     ]
     for fragment in render_page_parts(page_parts):
         page_html.append(f"    {fragment}")
     page_html.extend([
+        '    </div>',
+        f'    <footer class="page-footer"><div class="page-number" data-page-number="{page_index}">Page {page_index}</div></footer>',
         '  </article>',
         '</section>',
     ])
@@ -876,6 +992,7 @@ def build_semantic_page_html(
         "skipped_watermarks": skipped_watermarks,
         "ocr_used": 0,
         "preserved_image_regions": len(images),
+        "header_footer_suppressed": suppressed_count,
     }
     return "\n".join(page_html), debug_info
 
@@ -885,24 +1002,29 @@ def merge_cross_page_paragraphs(pages_html: List[str]) -> List[str]:
     for idx in range(1, len(merged)):
         prev = merged[idx - 1]
         cur = merged[idx]
-        prev_match = re.search(r"<p([^>]*)>([^<]+)</p>\s*</article>\s*</section>\s*$", prev, re.DOTALL)
-        cur_match = re.search(r"(<article[^>]*>\s*)<p([^>]*)>([^<]+)</p>", cur, re.DOTALL)
+        prev_match = re.search(r"<p([^>]*)>([^<]+)</p>\s*</div>\s*<footer", prev, re.DOTALL)
+        cur_match = re.search(r"(<div class=\"page-body\">\s*)<p([^>]*)>([^<]+)</p>", cur, re.DOTALL)
         if not prev_match or not cur_match:
             continue
         prev_text = normalize_text(html.unescape(prev_match.group(2)))
         cur_text = normalize_text(html.unescape(cur_match.group(3)))
         if not prev_text or not cur_text:
             continue
-        if prev_text[-1] in ".!?:;" or re.match(r"^(\d+\.|[A-Z][A-Z\s]{2,}|[\(\[]?[a-zA-Z0-9]+[\)\.])", cur_text):
+        starts_as_new_structure = bool(re.match(r"^(\d+\.|\(\d+\)|[ivxlcdmIVXLCDM]+\)|[A-Z][A-Z\s]{5,})", cur_text))
+        starts_as_continuation = bool(cur_text[:1].islower()) or bool(
+            re.match(r"^(and|or|but|that|which|who|where|when|for|to|of|in|on)\b", cur_text, re.IGNORECASE)
+        )
+        should_merge = (prev_text[-1] not in ".!?:;") or starts_as_continuation
+        if (not should_merge) or starts_as_new_structure:
             continue
         combined = html.escape(f"{prev_text} {cur_text}")
         new_prev = re.sub(
-            r"<p([^>]*)>[^<]+</p>\s*</article>\s*</section>\s*$",
-            f'<p{prev_match.group(1)} data-source-pages="{idx}-{idx+1}">{combined}</p>\n  </article>\n</section>',
+            r"<p([^>]*)>[^<]+</p>\s*</div>\s*<footer",
+            f'<p{prev_match.group(1)} data-source-pages="{idx}-{idx+1}">{combined}</p>\n    </div>\n    <footer',
             prev,
             flags=re.DOTALL,
         )
-        new_cur = re.sub(r"(<article[^>]*>\s*)<p[^>]*>[^<]+</p>\s*", r"\1", cur, count=1, flags=re.DOTALL)
+        new_cur = re.sub(r"(<div class=\"page-body\">\s*)<p[^>]*>[^<]+</p>\s*", r"\1", cur, count=1, flags=re.DOTALL)
         merged[idx - 1] = new_prev
         merged[idx] = new_cur
     return merged
@@ -930,9 +1052,11 @@ def emit_html(doc: fitz.Document, keep_all_images: bool, page_scale: float, temp
     watermark_removal_enabled = watermark_detection.found and not keep_all_images
     profile = inspect_document(doc, extract_text_lines, is_bullet_line)
     classification = classify_document(profile, watermark_detection.found)
+    header_footer_profile = build_header_footer_profile(doc)
 
     pages_html: List[str] = []
     debug_summary: List[dict] = []
+    prev_page_tail: str | None = None
 
     for page_index, page in enumerate(doc, start=1):
         page_html, page_debug = build_semantic_page_html(
@@ -942,9 +1066,14 @@ def emit_html(doc: fitz.Document, keep_all_images: bool, page_scale: float, temp
             image_counts=image_counts,
             keep_all_images=keep_all_images,
             watermark_removal_enabled=watermark_removal_enabled,
+            header_footer_profile=header_footer_profile,
+            prev_page_tail=prev_page_tail,
         )
         pages_html.append(page_html)
         debug_summary.append(page_debug)
+        tail_lines = _extract_page_lines(page)
+        tail_lines, _ = suppress_header_footer_lines(tail_lines, header_footer_profile)
+        prev_page_tail = normalize_text(tail_lines[-1].text) if tail_lines else None
 
     pages_html = merge_cross_page_paragraphs(pages_html)
     page_classification_counts = Counter(item["page_classification"] for item in debug_summary)
@@ -983,8 +1112,8 @@ def emit_html(doc: fitz.Document, keep_all_images: bool, page_scale: float, temp
         style_css = extract_template_style(Path(DEFAULT_TEMPLATE_NAME))
     if not style_css:
         style_css = DEFAULT_LEGAL_CSS
-    elif "@page" not in style_css:
-        style_css = style_css + "\n" + DEFAULT_LEGAL_CSS
+    else:
+        style_css = style_css + "\n\n/* court-safe pagination overrides */\n" + DEFAULT_LEGAL_CSS
     raw_html = render_document_shell(
         title=title,
         note=note,
